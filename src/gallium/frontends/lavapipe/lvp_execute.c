@@ -4656,6 +4656,42 @@ handle_trace_rays_indirect2(struct vk_cmd_queue_entry *cmd, struct rendering_sta
    state->pctx->launch_grid(state->pctx, &state->trace_rays_info);
 }
 
+static void
+handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
+{
+   //struct vk_cmd_encode_video_khr *encode = &cmd->u.encode_video_khr;
+
+   ////VK_FROM_HANDLE(lvp_query_pool, pool, encode->query_pool);
+
+   //uint64_t *dst = pool->data;
+   //dst += write->first_query;
+
+   //for (uint32_t i = 0; i < write->acceleration_structure_count; i++) {
+   //   VK_FROM_HANDLE(vk_acceleration_structure, accel_struct, write->acceleration_structures[i]);
+
+   //   switch ((uint32_t)pool->base_type) {
+   //   case LVP_QUERY_ACCELERATION_STRUCTURE_COMPACTED_SIZE:
+   //      dst[i] = accel_struct->size;
+   //      break;
+   //   case LVP_QUERY_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE: {
+   //      struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
+   //      dst[i] = header->serialization_size;
+   //      break;
+   //   }
+   //   case LVP_QUERY_ACCELERATION_STRUCTURE_SIZE:
+   //      dst[i] = accel_struct->size;
+   //      break;
+   //   case LVP_QUERY_ACCELERATION_STRUCTURE_INSTANCE_COUNT: {
+   //      struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
+   //      dst[i] = header->instance_count;
+   //      break;
+   //   }
+   //   default:
+   //      unreachable("Unsupported query type");
+   //   }
+   //}
+}
+
 void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
 {
    struct vk_device_dispatch_table cmd_enqueue_dispatch;
