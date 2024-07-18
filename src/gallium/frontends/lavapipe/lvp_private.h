@@ -613,7 +613,7 @@ struct lvp_buffer_view {
 #define LVP_QUERY_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE (PIPE_QUERY_TYPES + 1)
 #define LVP_QUERY_ACCELERATION_STRUCTURE_SIZE (PIPE_QUERY_TYPES + 2)
 #define LVP_QUERY_ACCELERATION_STRUCTURE_INSTANCE_COUNT (PIPE_QUERY_TYPES + 3)
-#define LVP_QUERY_VIDEO_ENCODE_FEEDBACK (PIPE_QUERY_TYPES + 4)
+#define LVP_QUERY_VIDEO_ENCODE_FEEDBACK (PIPE_QUERY_DRIVER_SPECIFIC)
 
 struct lvp_query_pool {
    struct vk_object_base base;
@@ -642,11 +642,6 @@ struct lvp_cmd_buffer {
    struct lvp_device *                          device;
 
    uint8_t push_constants[MAX_PUSH_CONSTANTS_SIZE];
-
-   struct {
-      struct lvp_video_session *vid;
-      struct lvp_video_session_params *params;
-   } video;
 };
 
 struct lvp_indirect_command_layout_nv {
