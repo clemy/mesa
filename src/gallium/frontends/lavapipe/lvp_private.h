@@ -86,6 +86,7 @@ typedef uint32_t xcb_window_t;
 #include "vk_sampler.h"
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
+#include "vk_video.h"
 #include "vk_ycbcr_conversion.h"
 #include "lp_jit.h"
 
@@ -612,6 +613,7 @@ struct lvp_buffer_view {
 #define LVP_QUERY_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE (PIPE_QUERY_TYPES + 1)
 #define LVP_QUERY_ACCELERATION_STRUCTURE_SIZE (PIPE_QUERY_TYPES + 2)
 #define LVP_QUERY_ACCELERATION_STRUCTURE_INSTANCE_COUNT (PIPE_QUERY_TYPES + 3)
+#define LVP_QUERY_VIDEO_ENCODE_FEEDBACK (PIPE_QUERY_TYPES + 4)
 
 struct lvp_query_pool {
    struct vk_object_base base;
@@ -623,12 +625,28 @@ struct lvp_query_pool {
    struct pipe_query *queries[0];
 };
 
+struct lvp_video_session {
+   struct vk_video_session vk;
+
+   /* the decoder needs some private memory allocations */
+   //struct anv_vid_mem vid_mem[ANV_VID_MEM_H265_MAX];
+};
+
+struct lvp_video_session_params {
+   struct vk_video_session_parameters vk;
+};
+
 struct lvp_cmd_buffer {
    struct vk_command_buffer vk;
 
    struct lvp_device *                          device;
 
    uint8_t push_constants[MAX_PUSH_CONSTANTS_SIZE];
+
+   struct {
+      struct lvp_video_session *vid;
+      struct lvp_video_session_params *params;
+   } video;
 };
 
 struct lvp_indirect_command_layout_nv {
@@ -698,6 +716,12 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(lvp_sampler, vk.base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
 VK_DEFINE_NONDISP_HANDLE_CASTS(lvp_indirect_command_layout_nv, base, VkIndirectCommandsLayoutNV,
                                VK_OBJECT_TYPE_INDIRECT_COMMANDS_LAYOUT_NV)
+VK_DEFINE_NONDISP_HANDLE_CASTS(lvp_video_session, vk.base,
+                               VkVideoSessionKHR,
+                               VK_OBJECT_TYPE_VIDEO_SESSION_KHR)
+VK_DEFINE_NONDISP_HANDLE_CASTS(lvp_video_session_params, vk.base,
+                               VkVideoSessionParametersKHR,
+                               VK_OBJECT_TYPE_VIDEO_SESSION_PARAMETERS_KHR)
 
 void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp);
 

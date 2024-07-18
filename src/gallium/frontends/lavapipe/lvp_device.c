@@ -260,6 +260,9 @@ static const struct vk_device_extension_table lvp_device_extensions_supported = 
    .GOOGLE_decorate_string                = true,
    .GOOGLE_hlsl_functionality1            = true,
    .NV_device_generated_commands          = true,
+   .KHR_video_queue                       = true,
+   .KHR_video_encode_queue                = true,
+   .KHR_video_encode_h264                 = true,
 };
 
 static bool
@@ -1477,11 +1480,31 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceQueueFamilyProperties2(
          .queueFlags = VK_QUEUE_GRAPHICS_BIT |
          VK_QUEUE_COMPUTE_BIT |
          VK_QUEUE_TRANSFER_BIT |
-         (DETECT_OS_LINUX ? VK_QUEUE_SPARSE_BINDING_BIT : 0),
+         (DETECT_OS_LINUX ? VK_QUEUE_SPARSE_BINDING_BIT : 0) |
+         VK_QUEUE_VIDEO_ENCODE_BIT_KHR,
          .queueCount = 1,
          .timestampValidBits = 64,
          .minImageTransferGranularity = (VkExtent3D) { 1, 1, 1 },
       };
+   }
+   if (!pQueueFamilyProperties) {
+      return;
+   }
+   for (uint32_t i = 0; i < *pCount; i++) {
+      vk_foreach_struct (ext, pQueueFamilyProperties[i].pNext) {
+         switch (ext->sType) {
+         case VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR: {
+            VkQueueFamilyVideoPropertiesKHR *prop = (VkQueueFamilyVideoPropertiesKHR *)ext;
+            prop->videoCodecOperations = 0;
+            if (pQueueFamilyProperties[i].queueFamilyProperties.queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR) {
+               prop->videoCodecOperations |= VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+            }
+            break;
+         }
+         default:
+            break;
+         }
+      }
    }
 }
 
