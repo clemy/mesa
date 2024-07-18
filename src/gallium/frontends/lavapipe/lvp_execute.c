@@ -2878,6 +2878,10 @@ static void handle_begin_query(struct vk_cmd_queue_entry *cmd,
    struct vk_cmd_begin_query *qcmd = &cmd->u.begin_query;
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
+   if (pool->type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
+      return;
+   }
+
    if (pool->type == VK_QUERY_TYPE_PIPELINE_STATISTICS &&
        pool->pipeline_stats & VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT)
       emit_compute_state(state);
@@ -2903,6 +2907,10 @@ static void handle_end_query(struct vk_cmd_queue_entry *cmd,
 {
    struct vk_cmd_end_query *qcmd = &cmd->u.end_query;
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
+
+   if (pool->type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
+      return;
+   }
    assert(pool->queries[qcmd->query]);
 
    state->pctx->end_query(state->pctx, pool->queries[qcmd->query]);
@@ -4657,39 +4665,60 @@ handle_trace_rays_indirect2(struct vk_cmd_queue_entry *cmd, struct rendering_sta
 }
 
 static void
+handle_begin_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
+{
+   struct vk_cmd_begin_video_coding_khr *begin_video_coding = &cmd->u.begin_video_coding_khr;
+
+   printf("Begin: %p\n", begin_video_coding->begin_info->videoSession);
+   /* TODO: Store video session and session parameters somewhere */
+}
+
+static void
+handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
+{
+   struct vk_cmd_control_video_coding_khr *control_video_coding = &cmd->u.control_video_coding_khr;
+
+   printf("Control: %u\n", control_video_coding->coding_control_info->flags);
+
+   /* TODO: Update video session parameters */
+}
+
+static void
 handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
-   //struct vk_cmd_encode_video_khr *encode = &cmd->u.encode_video_khr;
+   struct vk_cmd_encode_video_khr *encode_video = &cmd->u.encode_video_khr;
 
-   ////VK_FROM_HANDLE(lvp_query_pool, pool, encode->query_pool);
+   printf("Encode: %p\n", encode_video->encode_info->dstBuffer);
+   struct lvp_buffer *dst_buffer = lvp_buffer_from_handle(encode_video->encode_info->dstBuffer);
+   printf("Encode: %p\n", dst_buffer->bo);
 
-   //uint64_t *dst = pool->data;
-   //dst += write->first_query;
+   /* TODO: replace with encoded bitstream. Try to set some values in the destination buffer.. */
+   uint32_t *dst;
+   struct pipe_transfer *dst_t;
+   struct pipe_box box;
 
-   //for (uint32_t i = 0; i < write->acceleration_structure_count; i++) {
-   //   VK_FROM_HANDLE(vk_acceleration_structure, accel_struct, write->acceleration_structures[i]);
+   u_box_1d(0, 4, &box);
+   dst = state->pctx->buffer_map(state->pctx,
+                                   dst_buffer->bo,
+                                   0,
+                                   PIPE_MAP_WRITE,
+                                   &box,
+                                   &dst_t);
 
-   //   switch ((uint32_t)pool->base_type) {
-   //   case LVP_QUERY_ACCELERATION_STRUCTURE_COMPACTED_SIZE:
-   //      dst[i] = accel_struct->size;
-   //      break;
-   //   case LVP_QUERY_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE: {
-   //      struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
-   //      dst[i] = header->serialization_size;
-   //      break;
-   //   }
-   //   case LVP_QUERY_ACCELERATION_STRUCTURE_SIZE:
-   //      dst[i] = accel_struct->size;
-   //      break;
-   //   case LVP_QUERY_ACCELERATION_STRUCTURE_INSTANCE_COUNT: {
-   //      struct lvp_bvh_header *header = (void *)(uintptr_t)vk_acceleration_structure_get_va(accel_struct);
-   //      dst[i] = header->instance_count;
-   //      break;
-   //   }
-   //   default:
-   //      unreachable("Unsupported query type");
-   //   }
-   //}
+   memset(dst, 42, 4);
+   state->pctx->buffer_unmap(state->pctx, dst_t);
+
+   /* TODO: update query value? */
+}
+
+static void
+handle_end_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
+{
+   struct vk_cmd_end_video_coding_khr *end_video_coding = &cmd->u.end_video_coding_khr;
+
+   printf("End: %u\n", end_video_coding->end_coding_info->flags);
+
+   /* TODO: Unset video session and parameters */
 }
 
 void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
@@ -4846,6 +4875,11 @@ void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
    ENQUEUE_CMD(CmdTraceRaysIndirect2KHR)
    ENQUEUE_CMD(CmdTraceRaysIndirectKHR)
    ENQUEUE_CMD(CmdTraceRaysKHR)
+
+   ENQUEUE_CMD(CmdBeginVideoCodingKHR)
+   ENQUEUE_CMD(CmdControlVideoCodingKHR)
+   ENQUEUE_CMD(CmdEncodeVideoKHR)
+   ENQUEUE_CMD(CmdEndVideoCodingKHR)
 
 #undef ENQUEUE_CMD
 }
@@ -5240,6 +5274,18 @@ static void lvp_execute_cmd_buffer(struct list_head *cmds,
          break;
       case VK_CMD_TRACE_RAYS_KHR:
          handle_trace_rays(cmd, state);
+         break;
+      case VK_CMD_BEGIN_VIDEO_CODING_KHR:
+         handle_begin_video_coding(cmd, state);
+         break;
+      case VK_CMD_CONTROL_VIDEO_CODING_KHR:
+         handle_control_video_coding(cmd, state);
+         break;
+      case VK_CMD_ENCODE_VIDEO_KHR:
+         handle_encode_video(cmd, state);
+         break;
+      case VK_CMD_END_VIDEO_CODING_KHR:
+         handle_end_video_coding(cmd, state);
          break;
       default:
          fprintf(stderr, "Unsupported command %s\n", vk_cmd_queue_type_names[cmd->type]);
