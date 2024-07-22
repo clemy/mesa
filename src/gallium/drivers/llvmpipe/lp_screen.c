@@ -932,7 +932,8 @@ llvmpipe_destroy_screen(struct pipe_screen *_screen)
 
    util_vma_heap_finish(&screen->mem_heap);
 
-   close(screen->fd_mem_alloc);
+   if (screen->fd_mem_alloc > 0)
+      close(screen->fd_mem_alloc);
    mtx_destroy(&screen->mem_mutex);
    mtx_destroy(&screen->rast_mutex);
    mtx_destroy(&screen->cs_mutex);
