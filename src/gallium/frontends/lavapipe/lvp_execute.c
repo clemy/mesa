@@ -4683,6 +4683,9 @@ handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_sta
    /* TODO: Update video session parameters */
 }
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
 static void
 handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
@@ -4692,17 +4695,107 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    struct lvp_buffer *dst_buffer = lvp_buffer_from_handle(encode_video->encode_info->dstBuffer);
    printf("Encode: %p\n", dst_buffer->bo);
 
+   const struct lvp_image_view *src_image_view = lvp_image_view_from_handle(encode_video->encode_info->srcPictureResource.imageViewBinding);
+   const struct lvp_image *src_image = src_image_view->image;
+
+   struct pipe_box src_box;
+   struct pipe_transfer *src_t;
+   uint8_t *src_data;
+   uint8_t plane;
+   enum pipe_format src_format;
+   size_t size;
+   uint8_t* tmp_out;
+   static int img_num = 0;
+   char filename[256];
+
+   plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_0_BIT);
+   src_format = src_image->planes[plane].bo->format;
+
+   src_box.x = encode_video->encode_info->srcPictureResource.codedOffset.x;
+   src_box.y = encode_video->encode_info->srcPictureResource.codedOffset.y;
+   src_box.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
+   src_box.width = encode_video->encode_info->srcPictureResource.codedExtent.width;
+   src_box.height = encode_video->encode_info->srcPictureResource.codedExtent.height;
+   src_box.depth = 1;
+   
+   size = src_box.width * src_box.height;
+
+   src_data = state->pctx->texture_map(state->pctx,
+                                          src_image->planes[plane].bo,
+                                          0,
+                                          PIPE_MAP_READ,
+                                          &src_box,
+                                          &src_t);
+   
+   tmp_out = malloc(size);
+
+   util_copy_box(tmp_out, src_format,
+               src_box.width,
+               src_box.width * src_box.height,
+               0, 0, 0,
+               src_box.width,
+               src_box.height,
+               1,
+               src_data, src_t->stride, src_t->layer_stride, 0, 0, 0);
+
+   state->pctx->texture_unmap(state->pctx, src_t);
+
+
+   sprintf(filename, "imgY%04i.png", img_num);
+   stbi_write_png(filename, src_box.width, src_box.height, 1, tmp_out, src_box.width);
+
+   free(tmp_out);
+
+
+   plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_1_BIT);
+   src_format = src_image->planes[plane].bo->format;
+
+   src_box.x = encode_video->encode_info->srcPictureResource.codedOffset.x / 2;
+   src_box.y = encode_video->encode_info->srcPictureResource.codedOffset.y / 2;
+   src_box.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
+   src_box.width = encode_video->encode_info->srcPictureResource.codedExtent.width / 2;
+   src_box.height = encode_video->encode_info->srcPictureResource.codedExtent.height / 2;
+   src_box.depth = 1;
+
+   size = src_box.width * src_box.height * 2;
+
+   src_data = state->pctx->texture_map(state->pctx,
+                                          src_image->planes[plane].bo,
+                                          0,
+                                          PIPE_MAP_READ,
+                                          &src_box,
+                                          &src_t);
+   
+   tmp_out = malloc(size);
+
+   util_copy_box(tmp_out, src_format,
+               src_box.width * 2,
+               src_box.width * src_box.height * 2,
+               0, 0, 0,
+               src_box.width,
+               src_box.height,
+               1,
+               src_data, src_t->stride, src_t->layer_stride, 0, 0, 0);
+
+   state->pctx->texture_unmap(state->pctx, src_t);
+
+
+   sprintf(filename, "imgUV%04i.png", img_num++);
+   stbi_write_png(filename, src_box.width * 2, src_box.height, 1, tmp_out, src_box.width * 2);
+
+   free(tmp_out);
+
    /* TODO: replace with encoded bitstream. Try to set some values in the destination buffer.. */
    uint32_t *dst;
    struct pipe_transfer *dst_t;
-   struct pipe_box box;
+   struct pipe_box dst_box;
 
-   u_box_1d(0, 4, &box);
+   u_box_1d(0, 4, &dst_box);
    dst = state->pctx->buffer_map(state->pctx,
                                    dst_buffer->bo,
                                    0,
                                    PIPE_MAP_WRITE,
-                                   &box,
+                                   &dst_box,
                                    &dst_t);
 
    memset(dst, 42, 4);
