@@ -204,6 +204,10 @@ struct rendering_state {
    struct util_dynarray internal_buffers;
 
    struct lvp_pipeline *exec_graph;
+
+   struct {
+      struct lvp_query_pool *active_query;
+   } video_encode;
 };
 
 static struct pipe_resource *
@@ -2879,6 +2883,7 @@ static void handle_begin_query(struct vk_cmd_queue_entry *cmd,
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
    if (pool->type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
+      state->video_encode.active_query = pool;
       return;
    }
 
@@ -2909,6 +2914,7 @@ static void handle_end_query(struct vk_cmd_queue_entry *cmd,
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
    if (pool->type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
+      state->video_encode.active_query = NULL;
       return;
    }
    assert(pool->queries[qcmd->query]);
@@ -2920,6 +2926,7 @@ static void handle_end_query(struct vk_cmd_queue_entry *cmd,
 static void handle_begin_query_indexed_ext(struct vk_cmd_queue_entry *cmd,
                                            struct rendering_state *state)
 {
+   /* TODO: add support for video quries */
    struct vk_cmd_begin_query_indexed_ext *qcmd = &cmd->u.begin_query_indexed_ext;
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
 
@@ -2946,6 +2953,7 @@ static void handle_begin_query_indexed_ext(struct vk_cmd_queue_entry *cmd,
 static void handle_end_query_indexed_ext(struct vk_cmd_queue_entry *cmd,
                                          struct rendering_state *state)
 {
+   /* TODO: add support for video quries */
    struct vk_cmd_end_query_indexed_ext *qcmd = &cmd->u.end_query_indexed_ext;
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
    assert(pool->queries[qcmd->query]);
@@ -2959,6 +2967,12 @@ static void handle_reset_query_pool(struct vk_cmd_queue_entry *cmd,
    struct vk_cmd_reset_query_pool *qcmd = &cmd->u.reset_query_pool;
    LVP_FROM_HANDLE(lvp_query_pool, pool, qcmd->query_pool);
    for (unsigned i = qcmd->first_query; i < qcmd->first_query + qcmd->query_count; i++) {
+      if (pool->type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
+         int length = util_bitcount(pool->video_encode_feedback) + 1;
+         uint64_t *data = (uint64_t *)pool->data;
+         data[length - 1] = VK_QUERY_RESULT_STATUS_NOT_READY_KHR;
+         continue;
+      }
       if (pool->queries[i]) {
          state->pctx->destroy_query(state->pctx, pool->queries[i]);
          pool->queries[i] = NULL;
@@ -2988,6 +3002,7 @@ static void handle_write_timestamp2(struct vk_cmd_queue_entry *cmd,
 static void handle_copy_query_pool_results(struct vk_cmd_queue_entry *cmd,
                                            struct rendering_state *state)
 {
+   /* TODO: add support for video quries */
    struct vk_cmd_copy_query_pool_results *copycmd = &cmd->u.copy_query_pool_results;
    LVP_FROM_HANDLE(lvp_query_pool, pool, copycmd->query_pool);
    enum pipe_query_flags flags = (copycmd->flags & VK_QUERY_RESULT_WAIT_BIT) ? PIPE_QUERY_WAIT : 0;
@@ -4740,7 +4755,6 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
 
    state->pctx->texture_unmap(state->pctx, src_t);
 
-
    sprintf(filename, "imgY%04i.png", img_num);
    stbi_write_png(filename, src_box.width, src_box.height, 1, tmp_out, src_box.width);
 
@@ -4802,6 +4816,18 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    state->pctx->buffer_unmap(state->pctx, dst_t);
 
    /* TODO: update query value? */
+   struct lvp_query_pool *query = state->video_encode.active_query;
+   if (query) {
+      /* TODO: add an index to the last active query and increase it */
+      uint64_t *data = (uint64_t *)query->data;
+      if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR)
+         *data++ = 0;
+      if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR)
+         *data++ = 4;
+      if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR)
+         *data++ = 0;
+      *data = VK_QUERY_RESULT_STATUS_COMPLETE_KHR;
+   }
 }
 
 static void
