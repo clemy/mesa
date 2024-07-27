@@ -32,8 +32,11 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateQueryPool(
 {
    LVP_FROM_HANDLE(lvp_device, device, _device);
 
+   /* TODO: add (video) support for VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR */
+
    uint32_t query_size = sizeof(struct pipe_query *);
    enum pipe_query_type pipeq;
+   VkVideoEncodeFeedbackFlagsKHR video_encode_feedback;
    switch (pCreateInfo->queryType) {
    case VK_QUERY_TYPE_OCCLUSION:
       pipeq = PIPE_QUERY_OCCLUSION_COUNTER;
@@ -68,10 +71,12 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateQueryPool(
       pipeq = LVP_QUERY_ACCELERATION_STRUCTURE_INSTANCE_COUNT;
       break;
    case VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR:
-      /* TODO: the size depends on VkQueryPoolVideoEncodeFeedbackCreateInfoKHR in pNext, hardcoded for now 
-         to VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR | VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR */
-      query_size = 2 * sizeof(uint32_t);
+      const struct VkQueryPoolVideoEncodeFeedbackCreateInfoKHR *video_feedback = vk_find_struct_const(pCreateInfo->pNext, QUERY_POOL_VIDEO_ENCODE_FEEDBACK_CREATE_INFO_KHR);
+      video_encode_feedback = video_feedback->encodeFeedbackFlags;
+      query_size = (util_bitcount(video_encode_feedback) + 1) * sizeof(uint64_t);
       pipeq = LVP_QUERY_VIDEO_ENCODE_FEEDBACK;
+      /* TODO: implement support for larger pools, but check docu first how this is supported for video */
+      assert(pCreateInfo->queryCount == 1);
       break;
    default:
       return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -92,7 +97,10 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateQueryPool(
    pool->type = pCreateInfo->queryType;
    pool->count = pCreateInfo->queryCount;
    pool->base_type = pipeq;
-   pool->pipeline_stats = pCreateInfo->pipelineStatistics;
+   if (pCreateInfo->queryType == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR)
+      pool->video_encode_feedback = video_encode_feedback;
+   else
+      pool->pipeline_stats = pCreateInfo->pipelineStatistics;
    pool->data = &pool->queries;
 
    *pQueryPool = lvp_query_pool_to_handle(pool);
@@ -141,7 +149,25 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_GetQueryPoolResults(
       union pipe_query_result result;
       bool ready = false;
 
-      /* TODO: check structure and length for video encode */
+      /* TODO: handle wait bit and partial queries for video */
+      if (pool->base_type == LVP_QUERY_VIDEO_ENCODE_FEEDBACK) {
+         int length = util_bitcount(pool->video_encode_feedback);
+         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | flags & VK_QUERY_RESULT_WITH_STATUS_BIT_KHR)
+            ++length;
+         if (flags & VK_QUERY_RESULT_64_BIT) {
+            uint64_t *dst = (uint64_t *)dest;
+            uint64_t *src = (uint64_t *)pool->data;
+            for (int j = 0; j < length; ++j)
+               dst[j] = src[i * length + j];
+         } else {
+            uint32_t *dst = (uint32_t *)dest;
+            uint64_t *src = (uint64_t *)pool->data;
+            for (int j = 0; j < length; ++j)
+               dst[j] = src[i * length + j];
+         }
+         continue;
+      }
+
       if (pool->base_type >= PIPE_QUERY_TYPES) {
          if (flags & VK_QUERY_RESULT_64_BIT) {
             uint64_t *dst = (uint64_t *)dest;

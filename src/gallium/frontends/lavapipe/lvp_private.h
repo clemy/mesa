@@ -606,7 +606,11 @@ struct lvp_query_pool {
    struct vk_object_base base;
    VkQueryType type;
    uint32_t count;
-   VkQueryPipelineStatisticFlags pipeline_stats;
+   union {
+      VkQueryPipelineStatisticFlags pipeline_stats;
+      VkVideoEncodeFeedbackFlagsKHR video_encode_feedback;
+
+   };
    enum pipe_query_type base_type;
    void *data; /* Used by queries that are not implemented by pipe_query */
    struct pipe_query *queries[0];
