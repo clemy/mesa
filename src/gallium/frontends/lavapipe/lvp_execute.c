@@ -207,6 +207,7 @@ struct rendering_state {
 
    struct {
       struct lvp_query_pool *active_query;
+      struct lvp_video_session *active_video_session;
    } video_encode;
 };
 
@@ -4684,138 +4685,153 @@ handle_begin_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state
 {
    struct vk_cmd_begin_video_coding_khr *begin_video_coding = &cmd->u.begin_video_coding_khr;
 
-   printf("Begin: %p\n", begin_video_coding->begin_info->videoSession);
-   /* TODO: Store video session and session parameters somewhere */
+   //printf("Begin: %p\n", begin_video_coding->begin_info->videoSession);
+
+   VK_FROM_HANDLE(lvp_video_session, vid_session, begin_video_coding->begin_info->videoSession);
+   state->video_encode.active_video_session = vid_session;
+
+   /* TODO: Store session parameters */
 }
 
 static void
 handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
-   struct vk_cmd_control_video_coding_khr *control_video_coding = &cmd->u.control_video_coding_khr;
+   //struct vk_cmd_control_video_coding_khr *control_video_coding = &cmd->u.control_video_coding_khr;
 
-   printf("Control: %u\n", control_video_coding->coding_control_info->flags);
+   //printf("Control: %u\n", control_video_coding->coding_control_info->flags);
 
    /* TODO: Update video session parameters */
 }
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 
 static void
 handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_encode_video_khr *encode_video = &cmd->u.encode_video_khr;
 
-   printf("Encode: %p\n", encode_video->encode_info->dstBuffer);
+   //printf("Encode: %p\n", encode_video->encode_info->dstBuffer);
    struct lvp_buffer *dst_buffer = lvp_buffer_from_handle(encode_video->encode_info->dstBuffer);
-   printf("Encode: %p\n", dst_buffer->bo);
+   //printf("Encode: %p\n", dst_buffer->bo);
+
+   struct lvp_video_session* video_session = state->video_encode.active_video_session;
+   //printf("Encode VideoSession: %p\n", video_session);
 
    const struct lvp_image_view *src_image_view = lvp_image_view_from_handle(encode_video->encode_info->srcPictureResource.imageViewBinding);
    const struct lvp_image *src_image = src_image_view->image;
 
-   struct pipe_box src_box;
+   struct pipe_box src_box_y, src_box_uv;
    struct pipe_transfer *src_t;
    uint8_t *src_data;
    uint8_t plane;
    enum pipe_format src_format;
    size_t size;
-   uint8_t* tmp_out;
-   static int img_num = 0;
-   char filename[256];
 
    plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_0_BIT);
    src_format = src_image->planes[plane].bo->format;
 
-   src_box.x = encode_video->encode_info->srcPictureResource.codedOffset.x;
-   src_box.y = encode_video->encode_info->srcPictureResource.codedOffset.y;
-   src_box.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
-   src_box.width = encode_video->encode_info->srcPictureResource.codedExtent.width;
-   src_box.height = encode_video->encode_info->srcPictureResource.codedExtent.height;
-   src_box.depth = 1;
+   src_box_y.x = encode_video->encode_info->srcPictureResource.codedOffset.x;
+   src_box_y.y = encode_video->encode_info->srcPictureResource.codedOffset.y;
+   src_box_y.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
+   src_box_y.width = encode_video->encode_info->srcPictureResource.codedExtent.width;
+   src_box_y.height = encode_video->encode_info->srcPictureResource.codedExtent.height;
+   src_box_y.depth = 1;
    
-   size = src_box.width * src_box.height;
+   size = src_box_y.width * src_box_y.height;
 
    src_data = state->pctx->texture_map(state->pctx,
                                           src_image->planes[plane].bo,
                                           0,
                                           PIPE_MAP_READ,
-                                          &src_box,
+                                          &src_box_y,
                                           &src_t);
    
-   tmp_out = malloc(size);
+   uint8_t* data_y = malloc(size);
 
-   util_copy_box(tmp_out, src_format,
-               src_box.width,
-               src_box.width * src_box.height,
+   util_copy_box(data_y, src_format,
+               src_box_y.width,
+               src_box_y.width * src_box_y.height,
                0, 0, 0,
-               src_box.width,
-               src_box.height,
+               src_box_y.width,
+               src_box_y.height,
                1,
                src_data, src_t->stride, src_t->layer_stride, 0, 0, 0);
 
    state->pctx->texture_unmap(state->pctx, src_t);
-
-   sprintf(filename, "imgY%04i.png", img_num);
-   stbi_write_png(filename, src_box.width, src_box.height, 1, tmp_out, src_box.width);
-
-   free(tmp_out);
-
 
    plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_1_BIT);
    src_format = src_image->planes[plane].bo->format;
 
-   src_box.x = encode_video->encode_info->srcPictureResource.codedOffset.x / 2;
-   src_box.y = encode_video->encode_info->srcPictureResource.codedOffset.y / 2;
-   src_box.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
-   src_box.width = encode_video->encode_info->srcPictureResource.codedExtent.width / 2;
-   src_box.height = encode_video->encode_info->srcPictureResource.codedExtent.height / 2;
-   src_box.depth = 1;
+   src_box_uv.x = encode_video->encode_info->srcPictureResource.codedOffset.x / 2;
+   src_box_uv.y = encode_video->encode_info->srcPictureResource.codedOffset.y / 2;
+   src_box_uv.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
+   src_box_uv.width = encode_video->encode_info->srcPictureResource.codedExtent.width / 2;
+   src_box_uv.height = encode_video->encode_info->srcPictureResource.codedExtent.height / 2;
+   src_box_uv.depth = 1;
 
-   size = src_box.width * src_box.height * 2;
+   size = src_box_uv.width * src_box_uv.height;
+   uint8_t* data_u = malloc(size);
+   uint8_t* data_v = malloc(size);
 
    src_data = state->pctx->texture_map(state->pctx,
                                           src_image->planes[plane].bo,
                                           0,
                                           PIPE_MAP_READ,
-                                          &src_box,
+                                          &src_box_uv,
                                           &src_t);
    
-   tmp_out = malloc(size);
-
-   util_copy_box(tmp_out, src_format,
-               src_box.width * 2,
-               src_box.width * src_box.height * 2,
-               0, 0, 0,
-               src_box.width,
-               src_box.height,
-               1,
-               src_data, src_t->stride, src_t->layer_stride, 0, 0, 0);
+   for (int r = 0; r < src_box_uv.height; r++) {
+      for (int c = 0; c < src_box_uv.width; c++) {
+         data_u[r * src_box_uv.width + c] = src_data[r * src_t->stride + c * 2];
+         data_v[r * src_box_uv.width + c] = src_data[r * src_t->stride + c * 2 + 1];
+      }
+   }
 
    state->pctx->texture_unmap(state->pctx, src_t);
 
+   H264E_io_yuv_t yuv;
+   yuv.yuv[0] = data_y;
+   yuv.stride[0] = src_box_y.width;
 
-   sprintf(filename, "imgUV%04i.png", img_num++);
-   stbi_write_png(filename, src_box.width * 2, src_box.height, 1, tmp_out, src_box.width * 2);
+   yuv.yuv[1] = data_u;
+   yuv.stride[1] = src_box_uv.width;
 
-   free(tmp_out);
+   yuv.yuv[2] = data_v;
+   yuv.stride[2] = src_box_uv.width;
+
+   H264E_run_param_t run_param;
+   run_param.encode_speed = H264E_SPEED_SLOWEST;
+   run_param.frame_type = video_session->image_num == 0 ? H264E_FRAME_TYPE_KEY : H264E_FRAME_TYPE_I;
+   run_param.qp = 33; // TODO: get initial QP from SPS and set to enc->sps.pic_init_qp
+
+   uint8_t* coded_data;
+   int sizeof_coded_data = 0;
+   int error;
+
+   error = H264E_encode(video_session->enc, video_session->scratch, &run_param, &yuv, &coded_data, &sizeof_coded_data);
+   if (error)
+   {
+      printf("H264E_encode error = %d\n", error);
+   }
+
+   free(data_y);
+   free(data_u);
+   free(data_v);
 
    /* TODO: replace with encoded bitstream. Try to set some values in the destination buffer.. */
    uint32_t *dst;
    struct pipe_transfer *dst_t;
    struct pipe_box dst_box;
 
-   u_box_1d(0, 4, &dst_box);
+   u_box_1d(0, sizeof_coded_data, &dst_box);
    dst = state->pctx->buffer_map(state->pctx,
                                    dst_buffer->bo,
                                    0,
                                    PIPE_MAP_WRITE,
                                    &dst_box,
                                    &dst_t);
-
-   memset(dst, 42, 4);
+   memcpy(dst, coded_data, sizeof_coded_data);
    state->pctx->buffer_unmap(state->pctx, dst_t);
 
-   /* TODO: update query value? */
+   /* update query value */
    struct lvp_query_pool *query = state->video_encode.active_query;
    if (query) {
       /* TODO: add an index to the last active query and increase it */
@@ -4823,21 +4839,25 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR)
          *data++ = 0;
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR)
-         *data++ = 4;
+         *data++ = sizeof_coded_data;
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR)
          *data++ = 0;
-      *data = VK_QUERY_RESULT_STATUS_COMPLETE_KHR;
+      *data = error == H264E_STATUS_SUCCESS ? VK_QUERY_RESULT_STATUS_COMPLETE_KHR : VK_QUERY_RESULT_STATUS_ERROR_KHR;
    }
+
+   video_session->image_num++;
 }
 
 static void
 handle_end_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
-   struct vk_cmd_end_video_coding_khr *end_video_coding = &cmd->u.end_video_coding_khr;
+   //struct vk_cmd_end_video_coding_khr *end_video_coding = &cmd->u.end_video_coding_khr;
 
-   printf("End: %u\n", end_video_coding->end_coding_info->flags);
+   //printf("End: %u\n", end_video_coding->end_coding_info->flags);
 
-   /* TODO: Unset video session and parameters */
+   state->video_encode.active_video_session = NULL;
+
+   /* TODO: Unset video session parameters */
 }
 
 void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)

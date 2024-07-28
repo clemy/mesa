@@ -52,6 +52,7 @@
 #if DETECT_OS_ANDROID
 #include <vndk/hardware_buffer.h>
 #endif
+#include "h264enc.h"
 
 /* Pre-declarations needed for WSI entrypoints */
 struct wl_surface;
@@ -632,8 +633,9 @@ struct lvp_query_pool {
 struct lvp_video_session {
    struct vk_video_session vk;
 
-   /* the decoder needs some private memory allocations */
-   //struct anv_vid_mem vid_mem[ANV_VID_MEM_H265_MAX];
+   H264E_persist_t* enc;
+   H264E_scratch_t* scratch;
+   int image_num;
 };
 
 struct lvp_video_session_params {
