@@ -12,6 +12,7 @@ lvp_entrypoints = custom_target(
 )
 
 liblvp_files = files(
+    'h264enc.c',
     'lvp_acceleration_structure.c',
     'lvp_device.c',
     'lvp_device_generated_commands.c',

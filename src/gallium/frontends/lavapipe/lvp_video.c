@@ -3,64 +3,9 @@
 #include "vk_video/vulkan_video_codecs_common.h"
 
 /* TODO: check whole file for calling conventions VKAPI_ATTR and VKAPI_CALL */
-
-VkResult
-lvp_GetPhysicalDeviceVideoCapabilitiesKHR2(VkPhysicalDevice physicalDevice,
-                                           const VkVideoProfileInfoKHR *pVideoProfile,
-                                           VkVideoCapabilitiesKHR *pCapabilities)
-{
-   /* TODO: these capabilities are completely wrong (are for decode) */
-   //LVP_FROM_HANDLE(lvp_physical_device, physical_device, physicalDevice);
-
-   pCapabilities->minBitstreamBufferOffsetAlignment = 32;
-   pCapabilities->minBitstreamBufferSizeAlignment = 32;
-   pCapabilities->maxCodedExtent.width = 4096;
-   pCapabilities->maxCodedExtent.height = 4096;
-   pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
-
-   struct VkVideoDecodeCapabilitiesKHR *dec_caps = (struct VkVideoDecodeCapabilitiesKHR *)
-      vk_find_struct(pCapabilities->pNext, VIDEO_DECODE_CAPABILITIES_KHR);
-   if (dec_caps)
-      dec_caps->flags = VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR;
-
-   /* H264 allows different luma and chroma bit depths */
-   if (pVideoProfile->lumaBitDepth != pVideoProfile->chromaBitDepth)
-      return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
-
-   if (pVideoProfile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR)
-      return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
-
-   switch (pVideoProfile->videoCodecOperation) {
-   case VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR: {
-      struct VkVideoDecodeH264CapabilitiesKHR *ext = (struct VkVideoDecodeH264CapabilitiesKHR *)
-         vk_find_struct(pCapabilities->pNext, VIDEO_DECODE_H264_CAPABILITIES_KHR);
-
-      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
-         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
-
-      pCapabilities->maxDpbSlots = 17;
-      pCapabilities->maxActiveReferencePictures = 16;
-      pCapabilities->pictureAccessGranularity.width = 64;
-      pCapabilities->pictureAccessGranularity.height = 64;
-      pCapabilities->minCodedExtent.width = 64;
-      pCapabilities->minCodedExtent.height = 64;
-
-      ext->fieldOffsetGranularity.x = 0;
-      ext->fieldOffsetGranularity.y = 0;
-      ext->maxLevelIdc = STD_VIDEO_H264_LEVEL_IDC_5_1;
-      strcpy(pCapabilities->stdHeaderVersion.extensionName, VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_EXTENSION_NAME);
-      pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_H264_DECODE_SPEC_VERSION;
-      break;
-   }
-   default:
-      break;
-   }
-   return VK_SUCCESS;
-}
-
 #define LVP_MACROBLOCK_WIDTH  16
 #define LVP_MACROBLOCK_HEIGHT 16
-#define LVP_ENC_MAX_RATE_LAYER 4
+#define LVP_ENC_MAX_RATE_LAYER 1
 #define NUM_H2645_REFS        16
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -105,9 +50,7 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
       const struct VkVideoEncodeH264ProfileInfoKHR *h264_profile =
          vk_find_struct_const(pVideoProfile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
 
-      if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE &&
-          h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_MAIN &&
-          h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_HIGH)
+      if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
          return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
 
       if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
@@ -122,9 +65,9 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
       ext->maxPPictureL0ReferenceCount = 1;
       ext->maxBPictureL0ReferenceCount = 0;
       ext->maxL1ReferenceCount = 0;
-      ext->maxTemporalLayerCount = 4;
+      ext->maxTemporalLayerCount = 1;
       ext->expectDyadicTemporalLayerPattern = false;
-      ext->minQp = 0;
+      ext->minQp = 10;
       ext->maxQp = 51;
       ext->prefersGopRemainingFrames = false;
       ext->requiresGopRemainingFrames = false;
@@ -233,6 +176,38 @@ lvp_CreateVideoSessionKHR(VkDevice _device,
       return result;
    }
 
+   H264E_create_param_t create_param;
+   create_param.width = pCreateInfo->maxCodedExtent.width;
+   create_param.height = pCreateInfo->maxCodedExtent.height;
+   int sizeof_persist = 0, sizeof_scratch = 0, error;
+
+   error = H264E_sizeof(&create_param, &sizeof_persist, &sizeof_scratch);
+   if (error)
+   {
+      printf("H264E_sizeof error = %d\n", error);
+      vk_free2(&device->vk.alloc, pAllocator, vid);
+      return VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR;
+   }
+   printf("sizeof_persist = %d sizeof_scratch = %d\n", sizeof_persist, sizeof_scratch);
+   vid->enc = vk_alloc2(&device->vk.alloc, pAllocator, sizeof_persist, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   vid->scratch = vk_alloc2(&device->vk.alloc, pAllocator, sizeof_scratch, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!vid->enc || !vid->scratch)
+   {
+      vk_free2(&device->vk.alloc, pAllocator, vid->enc);
+      vk_free2(&device->vk.alloc, pAllocator, vid->scratch);
+      vk_free2(&device->vk.alloc, pAllocator, vid);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   error = H264E_init(vid->enc, &create_param);
+   if (error)
+   {
+      printf("H264E_init error = %d\n", error);
+      vk_free2(&device->vk.alloc, pAllocator, vid->enc);
+      vk_free2(&device->vk.alloc, pAllocator, vid->scratch);
+      vk_free2(&device->vk.alloc, pAllocator, vid);
+      return VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR;
+   }
+
    *pVideoSession = lvp_video_session_to_handle(vid);
    return VK_SUCCESS;
 }
@@ -244,6 +219,9 @@ lvp_DestroyVideoSessionKHR(VkDevice _device, VkVideoSessionKHR _session, const V
    VK_FROM_HANDLE(lvp_video_session, vid, _session);
    if (!_session)
       return;
+
+   vk_free2(&device->vk.alloc, pAllocator, vid->enc);
+   vk_free2(&device->vk.alloc, pAllocator, vid->scratch);
 
    vk_object_base_finish(&vid->vk.base);
    vk_free2(&device->vk.alloc, pAllocator, vid);
