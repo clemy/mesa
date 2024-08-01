@@ -245,6 +245,38 @@ typedef struct H264E_scratch_tag
 } scratch_t;
 
 /**
+*   Deblock filter frame context
+*/
+typedef struct
+{
+    // Motion vectors for 4x4 MB internal sub-blocks, top and left border,
+    // 5x5 array without top-left cell:
+    //     T0 T1 T2 T4
+    //  L0 i0 i1 i2 i3
+    //  L1 ...
+    //  ......
+    //
+    point_t df_mv[5*5 - 1];         // MV for current macroblock and neighbors
+    uint8_t *df_qp;                 // QP for current row of macroblocks
+    int8_t *mb_type;                // Macroblock type for current row of macroblocks
+    uint32_t nzflag;                // Bit flags for non-zero 4x4 blocks (left neighbors)
+
+    // Huffman and deblock uses different nnz...
+    uint8_t *df_nzflag;             // Bit flags for non-zero 4x4 blocks (top neighbors), only 4 bits used
+} deblock_filter_t;
+
+/**
+*    Deblock filter parameters for current MB
+*/
+typedef struct
+{
+    uint32_t strength32[4*2];       // Strength for 4 colums and 4 rows
+    uint8_t tc0[16*2];              // TC0 parameter for 4 colums and 4 rows
+    uint8_t alpha[2*2];             // alpha for border/internals
+    uint8_t beta[2*2];              // beta for border/internals
+} deblock_params_t;
+
+/**
 *   Persistent RAM
 */
 typedef struct H264E_persist_tag
@@ -333,6 +365,14 @@ typedef struct H264E_persist_tag
         //} qdat[2];
         uint16_t qdat[2][6 + 2 + 2 + 8 + 8 + 8 + 8];
     } rc;
+
+    deblock_filter_t df;            // Deblock filter
+
+    // Speed/quality trade-off
+    struct
+    {
+        int disable_deblock;        // Disable deblock filter flags
+    } speed;
 
     // predictors contexts
     point_t* mv_pred;               // MV for left&top 4x4 blocks
@@ -503,6 +543,55 @@ static const uint8_t qpy2qpc[52] = {  // todo: [0 - 9] not used
    35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39,
 };
 
+/**
+*   Deblock filter constants:
+*   <alpha> <thr[1]> <thr[2]> <thr[3]> <beta>
+*/
+static const uint8_t g_a_tc0_b[52 - 10][5] = {
+    {  0,  0,  0,  0,  0},  // 10
+    {  0,  0,  0,  0,  0},  // 11
+    {  0,  0,  0,  0,  0},  // 12
+    {  0,  0,  0,  0,  0},  // 13
+    {  0,  0,  0,  0,  0},  // 14
+    {  0,  0,  0,  0,  0},  // 15
+    {  4,  0,  0,  0,  2},
+    {  4,  0,  0,  1,  2},
+    {  5,  0,  0,  1,  2},
+    {  6,  0,  0,  1,  3},
+    {  7,  0,  0,  1,  3},
+    {  8,  0,  1,  1,  3},
+    {  9,  0,  1,  1,  3},
+    { 10,  1,  1,  1,  4},
+    { 12,  1,  1,  1,  4},
+    { 13,  1,  1,  1,  4},
+    { 15,  1,  1,  1,  6},
+    { 17,  1,  1,  2,  6},
+    { 20,  1,  1,  2,  7},
+    { 22,  1,  1,  2,  7},
+    { 25,  1,  1,  2,  8},
+    { 28,  1,  2,  3,  8},
+    { 32,  1,  2,  3,  9},
+    { 36,  2,  2,  3,  9},
+    { 40,  2,  2,  4, 10},
+    { 45,  2,  3,  4, 10},
+    { 50,  2,  3,  4, 11},
+    { 56,  3,  3,  5, 11},
+    { 63,  3,  4,  6, 12},
+    { 71,  3,  4,  6, 12},
+    { 80,  4,  5,  7, 13},
+    { 90,  4,  5,  8, 13},
+    {101,  4,  6,  9, 14},
+    {113,  5,  7, 10, 14},
+    {127,  6,  8, 11, 15},
+    {144,  6,  8, 13, 15},
+    {162,  7, 10, 14, 16},
+    {182,  8, 11, 16, 16},
+    {203,  9, 12, 18, 17},
+    {226, 10, 13, 20, 17},
+    {255, 11, 15, 23, 18},
+    {255, 13, 17, 25, 18},
+};
+
 /************************************************************************/
 /*  Adjustable encoder parameters. Initial MIN_QP values never used     */
 /************************************************************************/
@@ -587,6 +676,362 @@ ADJUSTABLE uint16_t g_deadzonei[] = {
 };
 
 #if H264E_ENABLE_PLAIN_C
+
+static uint8_t byteclip_deblock(int x)
+{
+    if (x > 255)
+    {
+        return 255;
+    }
+    if (x < 0)
+    {
+        return 0;
+    }
+    return (uint8_t)x;
+}
+
+static int clip_range(int range, int src)
+{
+    if (src > range)
+    {
+        src = range;
+    }
+    if (src < -range)
+    {
+        src = -range;
+    }
+    return src;
+}
+
+static void deblock_chroma(uint8_t *pix, int stride, int alpha, int beta, int thr, int strength)
+{
+    int p1, p0, q0, q1;
+    int delta;
+
+    if (strength == 0)
+    {
+        return;
+    }
+
+    p1 = pix[-2*stride];
+    p0 = pix[-1*stride];
+    q0 = pix[ 0*stride];
+    q1 = pix[ 1*stride];
+
+    if (ABS(p0 - q0) >= alpha || ABS(p1 - p0) >= beta || ABS(q1 - q0) >= beta)
+    {
+        return;
+    }
+
+    if (strength < 4)
+    {
+        int tC = thr + 1;
+        delta = (((q0 - p0)*4) + (p1 - q1) + 4) >> 3;
+        delta = clip_range(tC, delta);
+        pix[-1*stride] = byteclip_deblock(p0 + delta);
+        pix[ 0*stride] = byteclip_deblock(q0 - delta);
+    } else
+    {
+        pix[-1*stride] = (pix_t)((2*p1 + p0 + q1 + 2) >> 2);
+        pix[ 0*stride] = (pix_t)((2*q1 + q0 + p1 + 2) >> 2);
+    }
+}
+
+static void deblock_luma_v(uint8_t *pix, int stride, int alpha, int beta, const uint8_t *pthr, const uint8_t *pstr)
+{
+    int p2, p1, p0, q0, q1, q2, thr;
+    int ap, aq, delta, cloop, i;
+    for (i = 0; i < 4; i++)
+    {
+        cloop = 4;
+        if (pstr[i])
+        {
+            thr = pthr[i];
+            do
+            {
+                p1 = pix[-2];
+                p0 = pix[-1];
+                q0 = pix[ 0];
+                q1 = pix[ 1];
+
+                //if (ABS(p0 - q0) < alpha && ABS(p1 - p0) < beta && ABS(q1 - q0) < beta)
+                if (((ABS(p0 - q0) - alpha) & (ABS(p1 - p0) - beta) & (ABS(q1 - q0) - beta)) < 0)
+                {
+                    int tC = thr;
+                    // avoid conditons
+                    int sp, sq, d2;
+                    p2 = pix[-3];
+                    q2 = pix[ 2];
+                    ap = ABS(p2 - p0);
+                    aq = ABS(q2 - q0);
+                    delta = (((q0 - p0)*4) + (p1 - q1) + 4) >> 3;
+
+                    sp = (ap - beta) >> 31;
+                    sq = (aq - beta) >> 31;
+                    d2 = (((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1) & sp;
+                    d2 = clip_range(thr, d2);
+                    pix[-2] = (pix_t)(p1 + d2);
+                    d2 = (((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1) & sq;
+                    d2 = clip_range(thr, d2);
+                    pix[ 1] = (pix_t)(q1 + d2);
+                    tC = thr - sp - sq;
+                    delta = clip_range(tC, delta);
+                    pix[-1] = byteclip_deblock(p0 + delta);
+                    pix[ 0] = byteclip_deblock(q0 - delta);
+                }
+                pix += stride;
+            } while (--cloop);
+        } else
+        {
+                pix += 4*stride;
+        }
+    }
+}
+
+static void deblock_luma_h_s4(uint8_t *pix, int stride, int alpha, int beta)
+{
+    int p3, p2, p1, p0, q0, q1, q2, q3;
+    int ap, aq, cloop = 16;
+    do
+    {
+        int abs_p0_q0, abs_p1_p0, abs_q1_q0;
+        p1 = pix[-2*stride];
+        p0 = pix[-1*stride];
+        q0 = pix[ 0*stride];
+        q1 = pix[ 1*stride];
+        abs_p0_q0 = ABS(p0 - q0);
+        abs_p1_p0 = ABS(p1 - p0);
+        abs_q1_q0 = ABS(q1 - q0);
+        if (abs_p0_q0 < alpha && abs_p1_p0 < beta && abs_q1_q0 < beta)
+        {
+            int short_p = (2*p1 + p0 + q1 + 2);
+            int short_q = (2*q1 + q0 + p1 + 2);
+
+            if (abs_p0_q0 < ((alpha>>2)+2))
+            {
+                p2 = pix[-3*stride];
+                q2 = pix[ 2*stride];
+                ap = ABS(p2 - p0);
+                aq = ABS(q2 - q0);
+                if (ap < beta)
+                {
+                    int t = p2 + p1 + p0 + q0 + 2;
+                    p3 = pix[-4*stride];
+                    short_p += t - p1 + q0; //(p2 + 2*p1 + 2*p0 + 2*q0 + q1 + 4) >> 3);
+                    short_p >>= 1;
+                    pix[-2*stride] = (pix_t)(t >> 2);
+                    pix[-3*stride] = (pix_t)((2*p3 + 2*p2 + t + 2) >> 3); //(2*p3 + 3*p2 + p1 + p0 + q0 + 4) >> 3);
+                }
+                if (aq < beta)
+                {
+                    int t = q2 + q1 + p0 + q0 + 2;
+                    q3 = pix[ 3*stride];
+                    short_q += (t - q1 + p0);//(q2 + 2*q1 + 2*q0 + 2*p0 + p1 + 4)>>3);
+                    short_q >>= 1;
+                    pix[ 1*stride] = (pix_t)(t >> 2);
+                    pix[ 2*stride] = (pix_t)((2*q3 + 2*q2 + t + 2) >> 3); //((2*q3 + 3*q2 + q1 + q0 + p0 + 4) >> 3);
+                }
+            }
+            pix[-1*stride] = (pix_t)(short_p >> 2);
+            pix[ 0*stride] = (pix_t)(short_q >> 2);
+        }
+        pix += 1;
+    } while (--cloop);
+}
+
+static void deblock_luma_v_s4(uint8_t *pix, int stride, int alpha, int beta)
+{
+    int p3, p2, p1, p0, q0, q1, q2, q3;
+    int ap, aq, cloop = 16;
+    do
+    {
+        p2 = pix[-3];
+        p1 = pix[-2];
+        p0 = pix[-1];
+        q0 = pix[ 0];
+        q1 = pix[ 1];
+        q2 = pix[ 2];
+        if (ABS(p0 - q0) < alpha && ABS(p1 - p0) < beta && ABS(q1 - q0) < beta)
+        {
+            ap = ABS(p2 - p0);
+            aq = ABS(q2 - q0);
+
+            if (ap < beta && ABS(p0 - q0) < ((alpha >> 2) + 2))
+            {
+                p3 = pix[-4];
+                pix[-1] = (pix_t)((p2 + 2*p1 + 2*p0 + 2*q0 + q1 + 4) >> 3);
+                pix[-2] = (pix_t)((p2 + p1 + p0 + q0 + 2) >> 2);
+                pix[-3] = (pix_t)((2*p3 + 3*p2 + p1 + p0 + q0 + 4) >> 3);
+            } else
+            {
+                pix[-1] = (pix_t)((2*p1 + p0 + q1 + 2) >> 2);
+            }
+
+            if (aq < beta && ABS(p0 - q0) < ((alpha >> 2) + 2))
+            {
+                q3 = pix[ 3];
+                pix[ 0] = (pix_t)((q2 + 2*q1 + 2*q0 + 2*p0 + p1 + 4) >> 3);
+                pix[ 1] = (pix_t)((q2 + q1 + p0 + q0 + 2) >> 2);
+                pix[ 2] = (pix_t)((2*q3 + 3*q2 + q1 + q0 + p0 + 4) >> 3);
+            } else
+            {
+                pix[ 0] = (pix_t)((2*q1 + q0 + p1 + 2) >> 2);
+            }
+        }
+        pix += stride;
+    } while (--cloop);
+}
+
+static void deblock_luma_h(uint8_t *pix, int stride, int alpha, int beta, const uint8_t *pthr, const uint8_t *pstr)
+{
+    int p2, p1, p0, q0, q1, q2;
+    int ap, aq, delta, i;
+    for (i = 0; i < 4; i++)
+    {
+        if (pstr[i])
+        {
+            int cloop = 4;
+            int thr = pthr[i];
+            do
+            {
+                p1 = pix[-2*stride];
+                p0 = pix[-1*stride];
+                q0 = pix[ 0*stride];
+                q1 = pix[ 1*stride];
+
+                //if (ABS(p0-q0) < alpha && ABS(p1-p0) < beta && ABS(q1-q0) < beta)
+                if (((ABS(p0-q0) - alpha) & (ABS(p1-p0) - beta) & (ABS(q1-q0) - beta)) < 0)
+                {
+                    int tC = thr;
+                    int sp, sq, d2;
+                    p2 = pix[-3*stride];
+                    q2 = pix[ 2*stride];
+                    ap = ABS(p2 - p0);
+                    aq = ABS(q2 - q0);
+                    delta = (((q0 - p0)*4) + (p1 - q1) + 4) >> 3;
+
+                    sp = (ap - beta) >> 31;
+                    d2 = (((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1) & sp;
+                    d2 = clip_range(thr, d2);
+                    pix[-2*stride] = (pix_t)(p1 + d2);
+
+                    sq = (aq - beta) >> 31;
+                    d2 = (((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1) & sq;
+                    d2 = clip_range(thr, d2);
+                    pix[ 1*stride] = (pix_t)(q1 + d2);
+
+                    tC = thr - sp - sq;
+                    delta = clip_range(tC, delta);
+
+                    pix[-1*stride] = byteclip_deblock(p0 + delta);
+                    pix[ 0*stride] = byteclip_deblock(q0 - delta);
+                }
+                pix += 1;
+            } while (--cloop);
+        } else
+        {
+            pix += 4;
+        }
+    }
+}
+
+static void deblock_chroma_v(uint8_t *pix, int32_t stride, int a, int b, const uint8_t *thr, const uint8_t *str)
+{
+    int i;
+    for (i = 0; i < 8; i++)
+    {
+        deblock_chroma(pix, 1, a, b, thr[i >> 1], str[i >> 1]);
+        pix += stride;
+    }
+}
+
+static void deblock_chroma_h(uint8_t *pix, int32_t stride, int a, int b, const uint8_t *thr, const uint8_t *str)
+{
+    int i;
+    for (i = 0; i < 8; i++)
+    {
+        deblock_chroma(pix, stride, a, b, thr[i >> 1], str[i >> 1]);
+        pix += 1;
+    }
+}
+
+static void h264e_deblock_chroma(uint8_t *pix, int32_t stride, const deblock_params_t *par)
+{
+    const uint8_t *alpha = par->alpha;
+    const uint8_t *beta  = par->beta;
+    const uint8_t *thr   = par->tc0;
+    const uint8_t *strength = (uint8_t *)par->strength32;
+    int a,b,x,y;
+    a = alpha[0];
+    b = beta[0];
+    for (x = 0; x < 16; x += 8)
+    {
+        uint32_t str = *(uint32_t*)&strength[x];
+        if (str && a)
+        {
+            deblock_chroma_v(pix + (x >> 1), stride, a, b, thr + x, strength + x);
+        }
+        a = alpha[1];
+        b = beta[1];
+    }
+    thr += 16;
+    strength += 16;
+    a = alpha[2];
+    b = beta[2];
+    for (y = 0; y < 16; y += 8)
+    {
+        uint32_t str = *(uint32_t*)&strength[y];
+        if (str && a)
+        {
+            deblock_chroma_h(pix, stride, a, b, thr + y, strength + y);
+        }
+        pix += 4*stride;
+        a = alpha[3];
+        b = beta[3];
+    }
+}
+
+static void h264e_deblock_luma(uint8_t *pix, int32_t stride, const deblock_params_t *par)
+{
+    const uint8_t *alpha = par->alpha;
+    const uint8_t *beta  = par->beta;
+    const uint8_t *thr   = par->tc0;
+    const uint8_t *strength = (uint8_t *)par->strength32;
+    int a = alpha[0];
+    int b = beta[0];
+    int x, y;
+    for (x = 0; x < 16; x += 4)
+    {
+        uint32_t str = *(uint32_t*)&strength[x];
+        if ((uint8_t)str == 4)
+        {
+            deblock_luma_v_s4(pix + x, stride, a, b);
+        } else if (str && a)
+        {
+            deblock_luma_v(pix + x, stride, a, b, thr + x, strength + x);
+        }
+        a = alpha[1];
+        b = beta[1];
+    }
+    a = alpha[2];
+    b = beta[2];
+    thr += 16;
+    strength += 16;
+    for (y = 0; y < 16; y += 4)
+    {
+        uint32_t str = *(uint32_t*)&strength[y];
+        if ((uint8_t)str == 4)
+        {
+            deblock_luma_h_s4(pix, stride, a, b);
+        } else if (str && a)
+        {
+            deblock_luma_h(pix, stride, a, b, thr + y, strength + y);
+        }
+        a = alpha[3];
+        b = beta[3];
+        pix += 4*stride;
+    }
+}
 
 #undef IS_NULL
 #define IS_NULL(p) ((p) < (pix_t *)32)
@@ -1607,6 +2052,8 @@ static void h264e_vlc_encode(bs_t* bs, int16_t* quant, int maxNumCoeff, uint8_t*
 /************************************************************************/
 /*      Hardcoded params (can be changed at compile time)               */
 /************************************************************************/
+#define ALPHA_OFS       0       // Deblock alpha offset
+#define BETA_OFS        0       // Deblock beta offset
 #define DQP_CHROMA      0       // chroma delta QP
 
 /************************************************************************/
@@ -2101,8 +2548,17 @@ static void encode_slice_header(h264e_enc_t* enc, int frame_type, int pps_id)
     }
     
     SE(enc->rc.prev_qp - enc->sps.pic_init_qp);     // slice_qp_delta
-    UE(1);             // disable deblock
+    UE(enc->speed.disable_deblock);             // disable deblock
 
+    if (enc->speed.disable_deblock != 1)
+    {
+#if ALPHA_OFS || BETA_OFS
+        SE(ALPHA_OFS/2);                            // slice_alpha_c0_offset_div2
+        SE(BETA_OFS/2);                             // slice_beta_offset_div2
+#else
+        U(2, 3);
+#endif
+    }
 }
 
 /**
@@ -2123,7 +2579,7 @@ static void mb_write(h264e_enc_t* enc)
     //    enc->i4x4mode[0] = enc->i4x4mode[enc->mb.x + 1] = 0x02020202;
     //}
 
-    //enc->df.nzflag = ((enc->df.nzflag >> 4) & 0x84210) | enc->df.df_nzflag[enc->mb.x];
+    enc->df.nzflag = ((enc->df.nzflag >> 4) & 0x84210) | enc->df.df_nzflag[enc->mb.x];
     for (i = 0; i < 4; i++)
     {
         nz[5 + i] = nnz_top[i];
@@ -2355,7 +2811,7 @@ static void mb_write(h264e_enc_t* enc)
                     h264e_vlc_encode(enc->bs, qv->qy[j].qv, 16 - intra16x16_flag, pnz);
                     if (*pnz)
                     {
-                        //enc->df.nzflag |= 1 << (5 + (j & 3) + 5 * (j >> 2));
+                        enc->df.nzflag |= 1 << (5 + (j & 3) + 5 * (j >> 2));
                     }
                 }
                 else
@@ -2505,6 +2961,162 @@ static void intra_choose_16x16(h264e_enc_t* enc, pix_t* left, pix_t* top, int av
 }
 
 /************************************************************************/
+/*      Deblock filter                                                  */
+/************************************************************************/
+#define MB_FLAG_SLICE_START_DEBLOCK_2 2
+
+/**
+*   Set deblock filter strength
+*/
+static void df_strength(deblock_filter_t *df, int mb_type, int mbx, uint8_t *strength)
+{
+    uint8_t *sv = strength;
+    uint8_t *sh = strength + 16;
+    int flag = df->nzflag;
+    df->df_nzflag[mbx] = (uint8_t)(flag >> 20);
+    /*
+        nzflag represents macroblock and it's neighbors with 24 bit flags:
+        0 1 2 3
+      4 5 6 7 8
+      A B C D E
+      F G H I J
+      K L K N O
+    */
+    {
+        if (mb_type < 5)
+        {
+            int ccloop = 4;
+            point_t *mv = df->df_mv;
+            do
+            {
+                int cloop = 4;
+                do
+                {
+                    int v = 0;
+                    if (flag & 3 << 4)
+                    {
+                        v = 2;
+                    } else if (mv_differs3(mv[4], mv[5]))
+                    {
+                        v = 1;
+                    }
+                    *sv = (uint8_t)v; sv += 4;
+
+                    v = 0;
+                    if (flag & 33)
+                    {
+                        v = 2;
+                    } else if (mv_differs3(mv[0], mv[5]))
+                    {
+                        v = 1;
+                    }
+                    *sh++ = (uint8_t)v;
+
+                    flag >>= 1;
+                    mv++;
+                } while(--cloop);
+                flag >>= 1;
+                sv -= 15;
+                mv++;
+            } while(--ccloop);
+        } else
+        {
+            // Deblock mode #3 (intra)
+            ((uint32_t*)(sv))[1] = ((uint32_t*)(sv))[2] = ((uint32_t*)(sv))[3] =             // for inner columns
+            ((uint32_t*)(sh))[1] = ((uint32_t*)(sh))[2] = ((uint32_t*)(sh))[3] = 0x03030303; // for inner rows
+        }
+        if ((mb_type >= 5 || df->mb_type[mbx - 1] >= 5)) // speculative read
+        {
+            ((uint32_t*)(strength))[0] = 0x04040404;    // Deblock mode #4 (strong intra) for left column
+        }
+        if ((mb_type >= 5 || df->mb_type[mbx    ] >= 5))
+        {
+            ((uint32_t*)(strength))[4] = 0x04040404;    // Deblock mode #4 (strong intra) for top row
+        }
+    }
+    df->mb_type[mbx] = (int8_t)mb_type;
+}
+
+/**
+*   Run deblock for current macroblock
+*/
+static void mb_deblock(deblock_filter_t *df, int mb_type, int qp_this, int mbx, int mby, H264E_io_yuv_t *mbyuv, int IntraBLFlag)
+{
+    int i, cr, qp, qp_left, qp_top;
+    deblock_params_t par;
+    uint8_t *alpha = par.alpha; //[2*2];
+    uint8_t *beta  = par.beta;  //[2*2];
+    uint32_t *strength32  = par.strength32; //[4*2]; // == uint8_t strength[16*2];
+    uint8_t *strength = (uint8_t *)strength32;
+    uint8_t *tc0 = par.tc0; //[16*2];
+
+    df_strength(df, mb_type, mbx, strength);
+    if (!mbx || (IntraBLFlag & MB_FLAG_SLICE_START_DEBLOCK_2))
+    {
+        strength32[0] = 0;
+    }
+
+    if (!mby)
+    {
+        strength32[4] = 0;
+    }
+
+    qp_top = df->df_qp[mbx];
+    qp_left = df->df_qp[mbx - 1];
+    df->df_qp[mbx] = (uint8_t)qp_this;
+
+    cr = 0;
+    for (;;)
+    {
+        const uint8_t *lut;
+        if (*((uint32_t*)strength))
+        {
+            qp = (qp_left + qp_this + 1) >> 1;
+            lut = g_a_tc0_b[-10 + qp + ALPHA_OFS];
+            alpha[0] = lut[0];
+            beta[0]  = lut[4 + (BETA_OFS - ALPHA_OFS)*5];
+            for (i = 0; i < 4; i++) tc0[i] = lut[strength[i]];
+        }
+        if (*((uint32_t*)(strength + 16)))
+        {
+            qp = (qp_top + qp_this + 1) >> 1;
+            lut = g_a_tc0_b[-10 + qp + ALPHA_OFS];
+
+            alpha[2]  = lut[0];
+            beta[2] = lut[4 + (BETA_OFS - ALPHA_OFS)*5];
+            for (i = 0; i < 4; i++) tc0[16 + i] = lut[strength[16 + i]];
+        }
+
+        lut = g_a_tc0_b[-10 + qp_this + ALPHA_OFS];
+        alpha[3] = alpha[1] = lut[0];
+        beta[3] = beta[1] = lut[4 + (BETA_OFS - ALPHA_OFS)*5];
+        for (i = 4; i < 16; i++)
+        {
+            tc0[i] = lut[strength[i]];
+            tc0[16 + i] = lut[strength[16 + i]];
+        }
+        if (cr)
+        {
+            int *t = (int *)tc0;
+            t[1] = t[2];         // TODO: need only for OMX
+            t[5] = t[6];
+            i = 2;
+            do
+            {
+                h264e_deblock_chroma(mbyuv->yuv[i], mbyuv->stride[i], &par);
+            } while (--i);
+            break;
+        }
+        h264e_deblock_luma(mbyuv->yuv[0], mbyuv->stride[0], &par);
+
+        qp_this = qpy2qpc[qp_this + DQP_CHROMA];
+        qp_left = qpy2qpc[qp_left + DQP_CHROMA];
+        qp_top = qpy2qpc[qp_top + DQP_CHROMA];
+        cr++;
+    }
+}
+
+/************************************************************************/
 /*      Macroblock encoding                                             */
 /************************************************************************/
 /**
@@ -2563,6 +3175,13 @@ static void mb_encode(h264e_enc_t* enc)
     }
 
     mb_write(enc);
+
+    if (!enc->speed.disable_deblock)
+    {
+        int mbx = enc->mb.x;
+        int mby = enc->mb.y;
+        mb_deblock(&enc->df, enc->mb.type, enc->rc.prev_qp, mbx, mby, &enc->dec, 0);
+    }
 }
 
 static void encode_slice(h264e_enc_t* enc, int frame_type, int pps_id)
@@ -2788,9 +3407,9 @@ static int enc_alloc_scratch(h264e_enc_t* enc, const H264E_create_param_t* par, 
     ALLOC(enc->nnz, nmbx * 8 + 8);
     ALLOC(enc->mv_pred, (nmbx * 4 + 8) * sizeof(point_t));
     //ALLOC(enc->i4x4mode, nmbx * 4 + 4);
-    //ALLOC(enc->df.df_qp, nmbx);
-    //ALLOC(enc->df.mb_type, nmbx);
-    //ALLOC(enc->df.df_nzflag, nmbx);
+    ALLOC(enc->df.df_qp, nmbx);
+    ALLOC(enc->df.mb_type, nmbx);
+    ALLOC(enc->df.df_nzflag, nmbx);
     ALLOC(enc->top_line, nmbx * 32 + 32 + 16);
     return (int)(p - p0);
 }
@@ -2962,6 +3581,8 @@ int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run
     {
         enc->run_param.qp = MIN_QP;
     }
+
+    enc->speed.disable_deblock = (opt->encode_speed == 8 || opt->encode_speed == 10);
 
     const sps_id = 0;
     const pps_id = sps_id * 4 + 0;
