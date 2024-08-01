@@ -623,7 +623,6 @@ struct lvp_video_session {
 
    H264E_persist_t* enc;
    H264E_scratch_t* scratch;
-   int image_num;
 };
 
 struct lvp_video_session_params {
