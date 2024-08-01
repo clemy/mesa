@@ -297,8 +297,8 @@ typedef struct H264E_persist_tag
         int nmb;                    // Number of macroblocks in frame
         int w;                      // Frame width, pixels
         int h;                      // Frame height, pixels
-        //rectangle_t mv_limit;       // Frame MV limits = frame + border extension
-        //rectangle_t mv_qpel_limit;  // Reduced MV limits for qpel interpolation filter
+        rectangle_t mv_limit;       // Frame MV limits = frame + border extension
+        rectangle_t mv_qpel_limit;  // Reduced MV limits for qpel interpolation filter
         int cropping_flag;          // Cropping indicator
     } frame;
 
@@ -328,8 +328,13 @@ typedef struct H264E_persist_tag
 
         int cost;                   // Best coding cost
         int avail;                  // Neighbor availability flags
+        point_t mvd[16];            // Delta-MV for each 4x4 sub-part
+        point_t mv[16];             // MV for each 4x4 sub-part
+
+        point_t mv_skip_pred;       // Skip MV predictor
     } mb;
 
+    H264E_io_yuv_t ref;             // Current reference picture
     H264E_io_yuv_t dec;             // Reconstructed current macroblock
 
     struct
@@ -396,6 +401,8 @@ typedef struct H264E_persist_tag
 
     pix_t* pbest;                   // Macroblock best predictor
     pix_t* ptest;                   // Macroblock predictor under test
+
+    point_t mv_clusters[2];         // MV clusterization for prediction
 
 } h264e_enc_t;
 
@@ -637,6 +644,20 @@ ADJUSTABLE uint16_t g_thr_inter2[] = {
     526, 526,
 };
 
+ADJUSTABLE uint16_t g_skip_thr_inter[52] =
+{
+    45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+    45, 45, 45, 44, 44,
+    44, 40, 37, 33, 30,
+    26, 32, 38, 45, 51,
+    57, 58, 58, 59, 59,
+    60, 66, 73, 79, 86,
+    92, 95, 98, 100, 103,
+    106, 200, 300, 400, 500,
+    600, 700, 800, 900, 1000,
+    1377, 1377,
+};
+
 ADJUSTABLE uint16_t g_lambda_q4[52] =
 {
     14, 14, 14, 14, 14, 14, 14, 14, 14, 14,
@@ -649,6 +670,20 @@ ADJUSTABLE uint16_t g_lambda_q4[52] =
     181, 401, 620, 840, 1059,
     1279, 1262, 1246, 1229, 1213,
     1196, 1196,
+};
+
+ADJUSTABLE uint16_t g_lambda_mv_q4[52] =
+{
+    13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+    13, 14, 15, 15, 16,
+    17, 18, 20, 21, 23,
+    24, 28, 32, 37, 41,
+    45, 53, 62, 70, 79,
+    87, 105, 123, 140, 158,
+    176, 195, 214, 234, 253,
+    272, 406, 541, 675, 810,
+    944, 895, 845, 796, 746,
+    697, 697,
 };
 
 ADJUSTABLE uint16_t g_skip_thr_i4x4[52] =
@@ -1412,6 +1447,204 @@ static int h264e_intra_choose_4x4(const pix_t *blockin, pix_t *blockpred, int av
     return best_m + (best_sad << 4);
 }
 
+static uint8_t byteclip(int x)
+{
+    if (x > 255) x = 255;
+    if (x < 0) x = 0;
+    return (uint8_t)x;
+}
+
+static int hpel_lpf(const uint8_t *p, int s)
+{
+    return p[0] - 5*p[s] + 20*p[2*s] + 20*p[3*s] - 5*p[4*s] + p[5*s];
+}
+
+static void copy_wh(const uint8_t *src, int src_stride, uint8_t *dst, int w, int h)
+{
+    int x, y;
+    for (y = 0; y < h; y++)
+    {
+        for (x = 0; x < w; x++)
+        {
+            dst [x] = src [x];
+        }
+        dst += 16;
+        src += src_stride;
+    }
+}
+
+static void hpel_lpf_diag(const uint8_t *src, int src_stride, uint8_t *h264e_restrict dst, int w, int h)
+{
+    ALIGN(16) int16_t scratch[21 * 16] ALIGN2(16);  /* 21 rows by 16 pixels per row */
+
+    /*
+     * Intermediate values will be 1/2 pel at Horizontal direction
+     * Starting at (0.5, -2) at top extending to (0.5, height + 3) at bottom
+     * scratch contains a 2D array of size (w)X(h + 5)
+     */
+    int y, x;
+    for (y = 0; y < h + 5; y++)
+    {
+        for (x = 0; x < w; x++)
+        {
+            scratch[y * w + x] = (int16_t)hpel_lpf(src + (y - 2) * src_stride + (x - 2), 1);
+        }
+    }
+
+    /* Vertical interpolate */
+    for (y = 0; y < h; y++)
+    {
+        for (x = 0; x < w; x++)
+        {
+            int pos = y * w + x;
+            int HalfCoeff =
+                scratch [pos] -
+                5 * scratch [pos + 1 * w] +
+                20 * scratch [pos + 2 * w] +
+                20 * scratch [pos + 3 * w] -
+                5 * scratch [pos + 4 * w] +
+                scratch [pos + 5 * w];
+
+            HalfCoeff = byteclip((HalfCoeff + 512) >> 10);
+
+            dst [y * 16 + x] = (uint8_t)HalfCoeff;
+        }
+    }
+}
+
+static void hpel_lpf_hor(const uint8_t *src, int src_stride, uint8_t *h264e_restrict dst, int w, int h)
+{
+    int x, y;
+    for (y = 0; y < h; y++)
+    {
+        for (x = 0; x < w; x++)
+        {
+            dst [y * 16 + x] = byteclip((hpel_lpf(src + y * src_stride + (x - 2), 1) + 16) >> 5);
+        }
+    }
+}
+
+static void hpel_lpf_ver(const uint8_t *src, int src_stride, uint8_t *h264e_restrict dst, int w, int h)
+{
+    int y, x;
+    for (y = 0; y < h; y++)
+    {
+        for (x = 0; x < w; x++)
+        {
+            dst [y * 16 + x] = byteclip((hpel_lpf(src + (y - 2) * src_stride + x, src_stride) + 16) >> 5);
+        }
+    }
+}
+
+static void average_16x16_unalign(uint8_t *dst, const uint8_t *src1, int src1_stride)
+{
+    int x, y;
+    for (y = 0; y < 16; y++)
+    {
+        for (x = 0; x < 16; x++)
+        {
+            dst[y * 16 + x] = (uint8_t)(((uint32_t)dst [y * 16 + x] + src1[y*src1_stride + x] + 1) >> 1);
+        }
+    }
+}
+
+static void h264e_qpel_average_wh_align(const uint8_t *src0, const uint8_t *src1, uint8_t *dst, point_t wh)
+{
+    int w = wh.s.x;
+    int h = wh.s.y;
+    int x, y;
+    for (y = 0; y < h; y++)
+    {
+        for (x = 0; x < w; x++)
+        {
+            dst[y * 16 + x] = (uint8_t)((src0[y * 16 + x] + src1[y * 16 + x] + 1) >> 1);
+        }
+    }
+}
+
+static void h264e_qpel_interpolate_luma(const uint8_t *src, int src_stride, uint8_t *h264e_restrict dst, point_t wh, point_t dxdy)
+{
+    ALIGN(16) uint8_t scratch[16*16] ALIGN2(16);
+    //  src += ((dx + 1) >> 2) + ((dy + 1) >> 2)*src_stride;            // dx == 3 ? next row; dy == 3 ? next line
+    //  dxdy              actions: Horizontal, Vertical, Diagonal, Average
+    //  0 1 2 3 +1        -   ha    h    ha+
+    //  1                 va  hva   hda  hv+a
+    //  2                 v   vda   d    v+da
+    //  3                 va+ h+va h+da  h+v+a
+    //  +stride
+    int32_t pos = 1 << (dxdy.s.x + 4*dxdy.s.y);
+    int dstused = 0;
+
+    if (pos == 1)
+    {
+        copy_wh(src, src_stride, dst, wh.s.x, wh.s.y);
+        return;
+    }
+    if (pos & 0xe0ee)// 1110 0000 1110 1110
+    {
+        hpel_lpf_hor(src + ((pos & 0xe000) ? src_stride : 0), src_stride, dst, wh.s.x, wh.s.y);
+        dstused++;
+    }
+    if (pos & 0xbbb0)// 1011 1011 1011 0000
+    {
+        hpel_lpf_ver(src + ((pos & 0x8880) ? 1 : 0), src_stride, dstused ? scratch : dst, wh.s.x, wh.s.y);
+        dstused++;
+    }
+    if (pos & 0x4e40)// 0100 1110 0100 0000
+    {
+        hpel_lpf_diag(src, src_stride, dstused ? scratch : dst, wh.s.x, wh.s.y);
+        dstused++;
+    }
+    if (pos & 0xfafa)// 1111 1010 1111 1010
+    {
+        assert(wh.s.x == 16 && wh.s.y == 16);
+        if (dstused == 2)
+        {
+            point_t p;
+
+            src = scratch;
+            src_stride = 16;
+            p.u32 = 16 + (16<<16);
+
+            h264e_qpel_average_wh_align(src, dst, dst, p);
+            return;
+        } else
+        {
+            src += ((dxdy.s.x + 1) >> 2) + ((dxdy.s.y + 1) >> 2)*src_stride;
+        }
+        average_16x16_unalign(dst, src, src_stride);
+    }
+}
+
+static void h264e_qpel_interpolate_chroma(const uint8_t *src, int src_stride, uint8_t *h264e_restrict dst, point_t wh, point_t dxdy)
+{
+    /* if fractionl mv is not (0, 0) */
+    if (dxdy.u32)
+    {
+        int a = (8 - dxdy.s.x) * (8 - dxdy.s.y);
+        int b = dxdy.s.x * (8 - dxdy.s.y);
+        int c = (8 - dxdy.s.x) * dxdy.s.y;
+        int d = dxdy.s.x * dxdy.s.y;
+        int h = wh.s.y;
+        do
+        {
+            int x;
+            for (x = 0; x < wh.s.x; x++)
+            {
+                dst[x] = (uint8_t)((
+                   a * src[             x] + b * src[             x + 1] +
+                   c * src[src_stride + x] + d * src[src_stride + x + 1] +
+                   32) >> 6);
+            }
+            dst += 16;
+            src += src_stride;
+        } while (--h);
+    } else
+    {
+        copy_wh(src, src_stride, dst, wh.s.x, wh.s.y);
+    }
+}
+
 static int sad_block(const pix_t* a, int a_stride, const pix_t* b, int b_stride, int w, int h)
 {
     int r, c, sad = 0;
@@ -1437,6 +1670,11 @@ static int h264e_sad_mb_unlaign_8x8(const pix_t* a, int a_stride, const pix_t* b
     sad[2] = sad_block(a, a_stride, b, 16, 8, 8);
     sad[3] = sad_block(a + 8, a_stride, b + 8, 16, 8, 8);
     return sad[0] + sad[1] + sad[2] + sad[3];
+}
+
+static int h264e_sad_mb_unlaign_wh(const pix_t *a, int a_stride, const pix_t *b, point_t wh)
+{
+    return sad_block(a, a_stride, b, 16, wh.s.x, wh.s.y);
 }
 
 static void h264e_copy_8x8(pix_t* d, int d_stride, const pix_t* s)
@@ -1475,6 +1713,26 @@ static void h264e_copy_16x16(pix_t* d, int d_stride, const pix_t* s, int s_strid
     } while (--cloop);
 }
 #endif /* H264E_ENABLE_PLAIN_C */
+
+#if H264E_ENABLE_PLAIN_C || (H264E_ENABLE_NEON && !defined(MINIH264_ASM))
+static void h264e_copy_borders(unsigned char *pic, int w, int h, int guard)
+{
+    int r, rowbytes = w + 2*guard;
+    unsigned char *d = pic - guard;
+    for (r = 0; r < h; r++, d += rowbytes)
+    {
+        memset(d, d[guard], guard);
+        memset(d + rowbytes - guard, d[rowbytes - guard - 1], guard);
+    }
+    d = pic - guard - guard*rowbytes;
+    for (r = 0; r < guard; r++)
+    {
+        memcpy(d, pic - guard, rowbytes);
+        memcpy(d + (guard + h)*rowbytes, pic - guard + (h - 1)*rowbytes, rowbytes);
+        d += rowbytes;
+    }
+}
+#endif /* H264E_ENABLE_PLAIN_C || (H264E_ENABLE_NEON && !defined(MINIH264_ASM)) */
 
 #if H264E_ENABLE_PLAIN_C
 #undef TRANSPOSE_BLOCK
@@ -2261,6 +2519,8 @@ static void h264e_vlc_encode(bs_t* bs, int16_t* quant, int maxNumCoeff, uint8_t*
 
 #define NNZ_NA          64
 
+#define MAX_MV_CAND     20
+
 #define STARTCODE_4BYTES 4
 
 /************************************************************************/
@@ -2270,6 +2530,9 @@ static void h264e_vlc_encode(bs_t* bs, int16_t* quant, int maxNumCoeff, uint8_t*
 #define BETA_OFS        0       // Deblock beta offset
 #define DQP_CHROMA      0       // chroma delta QP
 
+#define MV_RANGE        32      // Motion vector search range, pixels
+#define MV_GUARD        14      // Out-of-frame MV's restriction, pixels
+
 /************************************************************************/
 /*      Code shortcuts                                                  */
 /************************************************************************/
@@ -2278,9 +2541,9 @@ static void h264e_vlc_encode(bs_t* bs, int16_t* quant, int maxNumCoeff, uint8_t*
 #define UE(v)  h264e_bs_put_golomb(enc->bs, v)
 #define SE(v)  h264e_bs_put_sgolomb(enc->bs, v)
 #define SWAP(datatype, a, b) { datatype _ = a; a = b; b = _; }
-//#define SQR(x) ((x)*(x))
-//#define SQRP(pnt) SQR(pnt.s.x) + SQR(pnt.s.y)
-//#define SMOOTH(smth, p) smth.s.x = (63*smth.s.x + p.s.x + 32) >> 6;  smth.s.y = (63*smth.s.y + p.s.y + 32) >> 6;
+#define SQR(x) ((x)*(x))
+#define SQRP(pnt) SQR(pnt.s.x) + SQR(pnt.s.y)
+#define SMOOTH(smth, p) smth.s.x = (63*smth.s.x + p.s.x + 32) >> 6;  smth.s.y = (63*smth.s.y + p.s.y + 32) >> 6;
 #define MUL_LAMBDA(x, lambda) ((x)*(lambda) >> 4)
 
 
@@ -2318,6 +2581,16 @@ static unsigned __clz(unsigned v)
 static int bitsize_ue(int v)
 {
     return 2 * (32 - __clz(v + 1)) - 1;
+}
+
+/**
+*   Size of signed Golomb code
+*/
+static int bits_se(int v)
+{
+    v = 2*v - 1;
+    v ^= v >> 31;
+    return bitsize_ue(v);
 }
 
 
@@ -2413,6 +2686,14 @@ static pix_t* mb_input_chroma(h264e_enc_t* enc, int uv)
     return enc->inp.yuv[uv] + (enc->mb.x + enc->mb.y * enc->inp.stride[uv]) * 8;
 }
 
+/**
+*   @return absolute MV for current macroblock for given MV
+*/
+static point_t mb_abs_mv(h264e_enc_t *enc, point_t mv)
+{
+    return mv_add(mv, point(enc->mb.x*64, enc->mb.y*64));
+}
+
 /************************************************************************/
 /*      Pixel copy functions                                            */
 /************************************************************************/
@@ -2447,6 +2728,21 @@ static void pix_copy_cropped_mb(pix_t* d, int d_stride, const pix_t* s, int s_st
     } while (--nbottom);
 }
 
+/**
+*   Copy reconstructed frame to reference buffer, with borders extension
+*/
+static void pix_copy_recon_pic_to_ref(h264e_enc_t *enc)
+{
+    int c, h = enc->frame.h, w = enc->frame.w, guard = 16;
+    for (c = 0; c < 3; c++)
+    {
+       SWAP(pix_t*, enc->ref.yuv[c], enc->dec.yuv[c]);
+
+       h264e_copy_borders(enc->ref.yuv[c], w, h, guard);
+       if (!c) guard >>= 1, w >>= 1, h >>= 1;
+    }
+}
+
 /************************************************************************/
 /*      Median MV predictor                                             */
 /************************************************************************/
@@ -2474,6 +2770,83 @@ static int mb_avail_flag(const h264e_enc_t* enc)
 }
 
 /**
+*   @return median of 3 given integers
+*/
+#if !(H264E_ENABLE_SSE2 && (H264E_CONFIGS_COUNT == 1))
+static int me_median_of_3(int a, int b, int c)
+{
+    return MAX(MIN(MAX(a, b), c), MIN(a, b));
+}
+#endif
+
+/**
+*   @return median of 3 given motion vectors
+*/
+static point_t point_median_of_3(point_t a, point_t b, point_t c)
+{
+#if H264E_ENABLE_SSE2 && (H264E_CONFIGS_COUNT == 1)
+    __m128i a2 = _mm_cvtsi32_si128(a.u32);
+    __m128i b2 = _mm_cvtsi32_si128(b.u32);
+    point_t med;
+    med.u32 = _mm_cvtsi128_si32(_mm_max_epi16(_mm_min_epi16(_mm_max_epi16(a2, b2), _mm_cvtsi32_si128(c.u32)), _mm_min_epi16(a2, b2)));
+    return med;
+#else
+    return point(me_median_of_3(a.s.x, b.s.x, c.s.x),
+                 me_median_of_3(a.s.y, b.s.y, c.s.y));
+#endif
+}
+
+/**
+*   Save state of the MV predictor
+*/
+static void me_mv_medianpredictor_save_ctx(h264e_enc_t *enc, point_t *ctx)
+{
+    int i;
+    point_t *mvtop = enc->mv_pred + 8 + enc->mb.x*4;
+    for (i = 0; i < 4; i++)
+    {
+        *ctx++ = enc->mv_pred[i];
+        *ctx++ = enc->mv_pred[4 + i];
+        *ctx++ = mvtop[i];
+    }
+}
+
+/**
+*   Restore state of the MV predictor
+*/
+static void me_mv_medianpredictor_restore_ctx(h264e_enc_t *enc, const point_t *ctx)
+{
+    int i;
+    point_t *mvtop = enc->mv_pred + 8 + enc->mb.x*4;
+    for (i = 0; i < 4; i++)
+    {
+        enc->mv_pred[i] = *ctx++;
+        enc->mv_pred[4 + i] = *ctx++;
+        mvtop[i] = *ctx++;
+    }
+}
+
+/**
+*   Put motion vector to the deblock filter matrix.
+*   x,y,w,h refers to 4x4 blocks within 16x16 macroblock, and should be in the range [0,4]
+*/
+static void me_mv_dfmatrix_put(point_t *dfmv, int x, int y, int w, int h, point_t mv)
+{
+    int i;
+    assert(y < 4 && x < 4);
+
+    dfmv += y*5 + x + 5;   // 5x5 matrix without left-top cell
+    do
+    {
+        for (i = 0; i < w; i++)
+        {
+            dfmv[i] = mv;
+        }
+        dfmv += 5;
+    } while (--h);
+}
+
+/**
 *   Use given motion vector for prediction
 */
 static void me_mv_medianpredictor_put(h264e_enc_t* enc, int x, int y, int w, int h, point_t mv)
@@ -2495,6 +2868,205 @@ static void me_mv_medianpredictor_put(h264e_enc_t* enc, int x, int y, int w, int
     {
         mvtop[x + i] = mv;                // top = this
     }
+}
+
+/**
+*   Motion vector median predictor for non-skip macroblock, as defined in the standard
+*/
+static point_t me_mv_medianpredictor_get(const h264e_enc_t *enc, point_t xy, point_t wh)
+{
+    int x = xy.s.x >> 2;
+    int y = xy.s.y >> 2;
+    int w = wh.s.x >> 2;
+    int h = wh.s.y >> 2;
+    int mvPredType = MVPRED_MEDIAN;
+    point_t a, b, c, d, ret = point(0, 0);
+    point_t *mvtop = enc->mv_pred + 8 + enc->mb.x*4;
+    int flag = enc->mb.avail;
+
+    assert(y < 4);
+    assert(x < 4);
+    assert(w <= 4);
+    assert(h <= 4);
+
+    a = enc->mv_pred[y];
+    b = mvtop[x];
+    c = mvtop[x + w];
+    d = enc->mv_pred[4 + y];
+
+    if (!x)
+    {
+        if (!(flag & AVAIL_L))
+        {
+            a.u32 = MV_NA;
+        }
+        if (!(flag & AVAIL_TL))
+        {
+            d.u32 = MV_NA;
+        }
+    }
+    if (!y)
+    {
+        if (!(flag & AVAIL_T))
+        {
+            b.u32 = MV_NA;
+            if (x + w < 4)
+            {
+                c.u32 = MV_NA;
+            }
+            if (x > 0)
+            {
+                d.u32 = MV_NA;
+            }
+        }
+        if (!(flag & AVAIL_TL) && !x)
+        {
+            d.u32 = MV_NA;
+        }
+        if (!(flag & AVAIL_TR) && x + w == 4)
+        {
+            c.u32 = MV_NA;
+        }
+    }
+
+    if (x + w == 4 && (!(flag & AVAIL_TR) || y))
+    {
+        c = d;
+    }
+
+    if (AVAIL(a) && !AVAIL(b) && !AVAIL(c))
+    {
+        mvPredType = MVPRED_L;
+    } else if (!AVAIL(a) && AVAIL(b) && !AVAIL(c))
+    {
+        mvPredType = MVPRED_U;
+    } else if (!AVAIL(a) && !AVAIL(b) && AVAIL(c))
+    {
+        mvPredType = MVPRED_UR;
+    }
+
+    // Directional predictions
+    if (w == 2 && h == 4)
+    {
+        if (x == 0)
+        {
+            if (AVAIL(a))
+            {
+                mvPredType = MVPRED_L;
+            }
+        } else
+        {
+            if (AVAIL(c))
+            {
+                mvPredType = MVPRED_UR;
+            }
+        }
+    } else if (w == 4 && h == 2)
+    {
+        if (y == 0)
+        {
+            if (AVAIL(b))
+            {
+                mvPredType = MVPRED_U;
+            }
+        } else
+        {
+            if (AVAIL(a))
+            {
+                mvPredType = MVPRED_L;
+            }
+        }
+    }
+
+    switch(mvPredType)
+    {
+    default:
+    case MVPRED_MEDIAN:
+        if (!(AVAIL(b) || AVAIL(c)))
+        {
+            if (AVAIL(a))
+            {
+                ret = a;
+            }
+        } else
+        {
+            if (!AVAIL(a))
+            {
+                a = ret;
+            }
+            if (!AVAIL(b))
+            {
+                b = ret;
+            }
+            if (!AVAIL(c))
+            {
+                c = ret;
+            }
+            ret = point_median_of_3(a, b, c);
+        }
+        break;
+    case MVPRED_L:
+        if (AVAIL(a))
+        {
+            ret = a;
+        }
+        break;
+    case MVPRED_U:
+        if (AVAIL(b))
+        {
+            ret = b;
+        }
+        break;
+    case MVPRED_UR:
+        if (AVAIL(c))
+        {
+            ret = c;
+        }
+        break;
+    }
+    return ret;
+}
+
+/**
+*   Motion vector median predictor for skip macroblock
+*/
+static point_t me_mv_medianpredictor_get_skip(h264e_enc_t *enc)
+{
+    point_t pred_16x16 = me_mv_medianpredictor_get(enc, point(0, 0),  point(16, 16));
+    enc->mb.mv_skip_pred = point(0, 0);
+    if (!(~enc->mb.avail & (AVAIL_L | AVAIL_T)))
+    {
+        point_t *mvtop = enc->mv_pred + 8 + enc->mb.x*4;
+        if (!mv_is_zero(enc->mv_pred[0]) && !mv_is_zero(mvtop[0]))
+        {
+            enc->mb.mv_skip_pred = pred_16x16;
+        }
+    }
+    return pred_16x16;
+}
+
+/**
+*   Get starting points candidates for MV search
+*/
+static int me_mv_medianpredictor_get_cand(const h264e_enc_t *enc, point_t *mv)
+{
+    point_t *mv0 = mv;
+    point_t *mvtop = enc->mv_pred + 8 + enc->mb.x*4;
+    int flag = enc->mb.avail;
+    *mv++ = point(0, 0);
+    if ((flag & AVAIL_L) && AVAIL(enc->mv_pred[0]))
+    {
+        *mv++ = enc->mv_pred[0];
+    }
+    if ((flag & AVAIL_T) && AVAIL(mvtop[0]))
+    {
+        *mv++ = mvtop[0];
+    }
+    if ((flag & AVAIL_TR) && AVAIL(mvtop[4]))
+    {
+        *mv++ = mvtop[4];
+    }
+    return (int)(mv - mv0);
 }
 
 /************************************************************************/
@@ -2606,17 +3178,18 @@ static void nal_end(h264e_enc_t* enc)
 /*      Top-level syntax elements (SPS,PPS,Slice)                       */
 /************************************************************************/
 
-/**
-*   Encode Sequence Parameter Set (SPS)
-*   ref: [1] 7.3.2.1.1
-*/
-
 //temp global
 //#define dependency_id 1
 #define quality_id 0
 //#define default_base_mode_flag 0
+// TODO: use log2_max_frame_num_minus4 from profile
 #define log2_max_frame_num_minus4 1
 
+/**
+*   Encode Sequence Parameter Set (SPS)
+*   ref: [1] 7.3.2.1.1
+*/
+/*
 static void encode_sps(h264e_enc_t* enc, int profile_idc, int sps_id)
 {
     struct limit_t
@@ -2684,11 +3257,13 @@ static void encode_sps(h264e_enc_t* enc, int profile_idc, int sps_id)
 
     nal_end(enc);
 }
+*/
 
 /**
 *   Encode Picture Parameter Set (SPS)
 *   ref: [1] 7.3.2.2
 */
+/*
 static void encode_pps(h264e_enc_t* enc, int sps_id, int pps_id)
 {
     nal_start(enc, 0x68);
@@ -2719,6 +3294,7 @@ static void encode_pps(h264e_enc_t* enc, int sps_id, int pps_id)
 #endif
     nal_end(enc);
 }
+*/
 
 /**
 *   Encode Slice Header
@@ -2732,8 +3308,9 @@ static void encode_slice_header(h264e_enc_t* enc, int frame_type, int pps_id)
     memset(enc->i4x4mode, -1, (enc->frame.nmbx + 1)*4);
     memset(enc->nnz, NNZ_NA, (enc->frame.nmbx + 1) * 8);    // DF ignore slice borders, but uses it's own nnz's
 
-    const int is_reference_frame = frame_type == H264E_FRAME_TYPE_KEY; // nal_ref_idc != 0
-    //nal_start(enc, (frame_type == H264E_FRAME_TYPE_KEY ? 5 : 1) | (long_term_idx_update >= 0 ? 0x60 : 0));
+    //const int is_reference_frame = frame_type == H264E_FRAME_TYPE_KEY; // nal_ref_idc != 0
+    // TODO: take from passed slice header; for now every frame is a reference frame
+    const int is_reference_frame = 1; // nal_ref_idc != 0
     nal_start(enc, (frame_type == H264E_FRAME_TYPE_KEY ? 0x5 : 1) | (is_reference_frame ? 0x60 : 0));
 
     UE(enc->slice.start_mb_num);        // first_mb_in_slice
@@ -2745,11 +3322,12 @@ static void encode_slice_header(h264e_enc_t* enc, int frame_type, int pps_id)
         UE(enc->next_idr_pic_id);       // idr_pic_id
     }
     if (enc->slice.type == SLICE_TYPE_P) {
-        assert(0);
-        // num_ref_idx_active_override_flag
-        // ref_pic_list_modification()
+        U1(0);  // num_ref_idx_active_override_flag
+        // ref_pic_list_modification():
+        U1(0);  //  ref_pic_list_modification_flag_l0
     }
 
+    // dec_ref_pic_marking():
     if (is_reference_frame) {
         if (frame_type == H264E_FRAME_TYPE_KEY) {
             U1(0);  // no_output_of_prior_pics_flag
@@ -2757,8 +3335,7 @@ static void encode_slice_header(h264e_enc_t* enc, int frame_type, int pps_id)
         }
         else {
             // 7.3.3.3 Decoded reference picture marking syntax
-            // dec_ref_pic_marking()
-            assert(0);
+            U1(0);  // adaptive_ref_pic_marking_mode_flag
         }
     }
     
@@ -2803,26 +3380,26 @@ static void mb_write(h264e_enc_t* enc)
         nnz_left[i] = 0;
     }
 
-//l_skip:
-//    if (enc->mb.type == -1)
-//    {
-//        // encode skip macroblock
-//        assert(enc->slice.type != SLICE_TYPE_I);
-//
-//        // Increment run count
-//        enc->mb.skip_run++;
-//
-//        // Update predictors
-//        *(uint32_t*)(nnz_top + 4) = *(uint32_t*)(nnz_left + 4) = 0; // set chroma NNZ to 0
-//        me_mv_medianpredictor_put(enc, 0, 0, 4, 4, enc->mb.mv[0]);
-//        me_mv_dfmatrix_put(enc->df.df_mv, 0, 0, 4, 4, enc->mb.mv[0]);
-//
-//        // Update reference with reconstructed pixels
-//        h264e_copy_16x16(enc->dec.yuv[0], enc->dec.stride[0], enc->pbest, 16);
-//        h264e_copy_8x8(enc->dec.yuv[1], enc->dec.stride[1], enc->ptest);
-//        h264e_copy_8x8(enc->dec.yuv[2], enc->dec.stride[2], enc->ptest + 8);
-//    }
-//    else
+l_skip:
+    if (enc->mb.type == -1)
+    {
+        // encode skip macroblock
+        assert(enc->slice.type != SLICE_TYPE_I);
+
+        // Increment run count
+        enc->mb.skip_run++;
+
+        // Update predictors
+        *(uint32_t*)(nnz_top + 4) = *(uint32_t*)(nnz_left + 4) = 0; // set chroma NNZ to 0
+        me_mv_medianpredictor_put(enc, 0, 0, 4, 4, enc->mb.mv[0]);
+        me_mv_dfmatrix_put(enc->df.df_mv, 0, 0, 4, 4, enc->mb.mv[0]);
+
+        // Update reference with reconstructed pixels
+        h264e_copy_16x16(enc->dec.yuv[0], enc->dec.stride[0], enc->pbest, 16);
+        h264e_copy_8x8(enc->dec.yuv[1], enc->dec.stride[1], enc->ptest);
+        h264e_copy_8x8(enc->dec.yuv[2], enc->dec.stride[2], enc->ptest + 8);
+    }
+    else
     {
         if (enc->mb.type != 5)
         {
@@ -2897,12 +3474,12 @@ static void mb_write(h264e_enc_t* enc)
         cbpc = MIN(cbpc, 2);
 
         // Rollback to skip
-        //if (!(enc->mb.type | cbpl | cbpc) && // Inter prediction, all-zero after quantization
-        //    mv_equal(enc->mb.mv[0], enc->mb.mv_skip_pred)) // MV == MV preditor for skip
-        //{
-        //    enc->mb.type = -1;
-        //    goto l_skip;
-        //}
+        if (!(enc->mb.type | cbpl | cbpc) && // Inter prediction, all-zero after quantization
+            mv_equal(enc->mb.mv[0], enc->mb.mv_skip_pred)) // MV == MV preditor for skip
+        {
+            enc->mb.type = -1;
+            goto l_skip;
+        }
 
         mb_type = enc->mb.type;
         if (mb_type_svc >= 6)   // intra 16x16
@@ -2964,25 +3541,25 @@ static void mb_write(h264e_enc_t* enc)
         }
         else
         {
-            //int part, x = 0, y = 0;
-            //int dx = (enc->mb.type & 2) ? 2 : 4;
-            //int dy = (enc->mb.type & 1) ? 2 : 4;
-            //for (part = 0;; part++)
-            //{
-            //    SE(enc->mb.mvd[part].s.x);
-            //    SE(enc->mb.mvd[part].s.y);
-            //    me_mv_medianpredictor_put(enc, x, y, dx, dy, enc->mb.mv[part]);
-            //    me_mv_dfmatrix_put(enc->df.df_mv, x, y, dx, dy, enc->mb.mv[part]);
-            //    x = (x + dx) & 3;
-            //    if (!x)
-            //    {
-            //        y = (y + dy) & 3;
-            //        if (!y)
-            //        {
-            //            break;
-            //        }
-            //    }
-            //}
+            int part, x = 0, y = 0;
+            int dx = (enc->mb.type & 2) ? 2 : 4;
+            int dy = (enc->mb.type & 1) ? 2 : 4;
+            for (part = 0;; part++)
+            {
+                SE(enc->mb.mvd[part].s.x);
+                SE(enc->mb.mvd[part].s.y);
+                me_mv_medianpredictor_put(enc, x, y, dx, dy, enc->mb.mv[part]);
+                me_mv_dfmatrix_put(enc->df.df_mv, x, y, dx, dy, enc->mb.mv[part]);
+                x = (x + dx) & 3;
+                if (!x)
+                {
+                    y = (y + dy) & 3;
+                    if (!y)
+                    {
+                        break;
+                    }
+                }
+            }
         }
         cbp = cbpl + (cbpc << 4);
 
@@ -3289,6 +3866,634 @@ static void intra_choose_16x16(h264e_enc_t* enc, pix_t* left, pix_t* top, int av
 }
 
 /************************************************************************/
+/*      Inter mode encoding                                             */
+/************************************************************************/
+
+/**
+*   Sub-pel luma interpolation
+*/
+static void interpolate_luma(const pix_t *ref, int stride, point_t mv, point_t wh, pix_t *dst)
+{
+    ref += (mv.s.y >> 2) * stride + (mv.s.x >> 2);
+    mv.u32 &= 0x000030003;
+    h264e_qpel_interpolate_luma(ref, stride, dst, wh, mv);
+}
+
+/**
+*   Sub-pel chroma interpolation
+*/
+static void interpolate_chroma(h264e_enc_t *enc, point_t mv)
+{
+    int i;
+    for (i = 1; i < 3; i++)
+    {
+        point_t wh;
+        int part = 0, x = 0, y = 0;
+        wh.s.x = (enc->mb.type & 2) ? 4 : 8;
+        wh.s.y = (enc->mb.type & 1) ? 4 : 8;
+        if (enc->mb.type == -1) // skip
+        {
+            wh.s.x = wh.s.y = 8;
+        }
+
+        for (;;part++)
+        {
+            pix_t *ref;
+            mv = mb_abs_mv(enc, enc->mb.mv[part]);
+            ref = enc->ref.yuv[i] + ((mv.s.y >> 3) + y)*enc->ref.stride[i] + (mv.s.x >> 3) + x;
+            mv.u32 &= 0x00070007;
+            h264e_qpel_interpolate_chroma(ref, enc->ref.stride[i], enc->ptest + (i - 1)*8 + 16*y + x, wh, mv);
+            x = (x + wh.s.x) & 7;
+            if (!x)
+            {
+                y = (y + wh.s.y) & 7;
+                if (!y)
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/**
+*   RD cost of given MV
+*/
+static int me_mv_cost(point_t mv, point_t mv_pred, int qp)
+{
+    int nb = bits_se(mv.s.x - mv_pred.s.x) + bits_se(mv.s.y - mv_pred.s.y);
+    return MUL_LAMBDA(nb, g_lambda_mv_q4[qp]);
+}
+
+/**
+*   RD cost of given MV candidate (TODO)
+*/
+#define me_mv_cand_cost me_mv_cost
+//static int me_mv_cand_cost(point_t mv, point_t mv_pred, int qp)
+//{
+//    int nb = bits_se(mv.s.x - mv_pred.s.x) + bits_se(mv.s.y - mv_pred.s.y);
+//    return MUL_LAMBDA(nb, g_lambda_mv_q4[qp]);
+//}
+
+
+/**
+*   Modified full-pel motion search with small diamond algorithm
+*   note: diamond implemented with small modifications, trading speed for precision
+*/
+static int me_search_diamond(h264e_enc_t *enc, const pix_t *ref, const pix_t *b, int rowbytes, point_t *mv,
+    const rectangle_t *range, int qp, point_t mv_pred, int min_sad, point_t wh, pix_t *scratch, pix_t **ppbest, int store_bytes)
+{
+    // cache map           cache moves
+    //      3              0   x->1
+    //      *              1   x->0
+    //  1 * x * 0          2   x->3
+    //      *              3   x->2
+    //      2                   ^1
+
+    //   cache double moves:
+    //           prev               prev
+    //      x ->   0   ->   3   ==>   3   =>   1
+    //      x ->   0   ->   2   ==>   2   =>   1
+    //      x ->   0   ->   0   ==>   0   =>   1
+    //      x ->   0   ->   1   - impossible
+    //   prev SAD(n) is (n+4)
+    //
+
+    static const point_t dir2mv[] = {{{4, 0}},{{-4, 0}},{{0, 4}},{{0, -4}}};
+    union
+    {
+        uint16_t cache[8];
+        uint32_t cache32[4];
+    } sad;
+
+    int dir, cloop, dir_prev, cost;
+    point_t v;
+
+    assert(mv_in_rect(*mv, range));
+
+restart:
+    dir = 0;                // start gradient descend with direction dir2mv[0]
+    cloop = 4;              // try 4 directions
+    dir_prev = -1;          // not yet moved
+
+    // reset SAD cache
+    sad.cache32[0] = sad.cache32[1] = sad.cache32[2] = sad.cache32[3] = ~0u;
+
+    // 1. Full-pel ME with small diamond modification:
+    // center point moved immediately as soon as new minimum found
+    do
+    {
+        assert(dir >= 0 && dir < 4);
+
+        // Try next point. Avoid out-of-range moves
+        v = mv_add(*mv, dir2mv[dir]);
+        //if (mv_in_rect(v, range) && sad.cache[dir] == (uint16_t)~0u)
+        if (mv_in_rect(v, range) && sad.cache[dir] == 0xffffu)
+        {
+            cost = h264e_sad_mb_unlaign_wh(ref + ((v.s.y*rowbytes + v.s.x) >> 2), rowbytes, b, wh);
+            //cost += me_mv_cost(*mv, mv_pred, qp);
+            cost += me_mv_cost(v, mv_pred, qp);
+            sad.cache[dir] = (uint16_t)cost;
+            if (cost < min_sad)
+            {
+                // This point is better than center: move this point to center and continue
+                int corner = ~0;
+                if (dir_prev >= 0)                      // have previous move
+                {                                       // save cache point, which can be used in next iteration
+                    corner = sad.cache[4 + dir];        // see "cache double moves" above
+                }
+                sad.cache32[2] = sad.cache32[0];        // save current cache to 'previous'
+                sad.cache32[3] = sad.cache32[1];
+                sad.cache32[0] = sad.cache32[1] = ~0u;  // reset current cache
+                if (dir_prev >= 0)                      // but if have previous move
+                {                                       // one cache point can be reused from previous iteration
+                    sad.cache[dir_prev^1] = (uint16_t)corner; // see "cache double moves" above
+                }
+                sad.cache[dir^1] = (uint16_t)min_sad;   // previous center become a neighbor's
+                dir_prev = dir;                         // save this direction
+                dir--;                                  // start next iteration with the same direction
+                cloop = 4 + 1;                          // and try 4 directions (+1 for do-while loop)
+                *mv = v;                                // Save best point found
+                min_sad = cost;                         // and it's SAD
+            }
+        }
+        dir = (dir + 1) & 3;                            // cycle search directions
+    } while(--cloop);
+
+    // 2. Optional: Try diagonal step
+    //if (1)
+    {
+        int primary_dir   = sad.cache[3] >= sad.cache[2] ? 2 : 3;
+        int secondary_dir = sad.cache[1] >= sad.cache[0] ? 0 : 1;
+        if (sad.cache[primary_dir] < sad.cache[secondary_dir])
+        {
+            SWAP(int, secondary_dir, primary_dir);
+        }
+
+        v = mv_add(dir2mv[secondary_dir], dir2mv[primary_dir]);
+        v = mv_add(*mv, v);
+        //cost = (uint16_t)~0u;
+        if (mv_in_rect(v, range))
+        {
+            cost = h264e_sad_mb_unlaign_wh(ref + ((v.s.y*rowbytes + v.s.x) >> 2), rowbytes, b, wh);
+            cost += me_mv_cost(v, mv_pred, qp);
+            if (cost < min_sad)
+            {
+                *mv = v;//mv_add(*mv, v);
+                min_sad = cost;
+                goto restart;
+            }
+        }
+    }
+
+    interpolate_luma(ref, rowbytes, *mv, wh, scratch);    // Plain NxM copy can be used
+    *ppbest = scratch;
+
+    // 3. Fractional pel search
+    if (enc->run_param.encode_speed < 9 && mv_in_rect(*mv, &enc->frame.mv_qpel_limit))
+    {
+        point_t vbest = *mv;
+        pix_t *pbest = scratch;
+        pix_t *hpel  = scratch + store_bytes;
+        pix_t *hpel1 = scratch + ((store_bytes == 8) ? 256 : 2*store_bytes);
+        pix_t *hpel2 = hpel1 + store_bytes;
+
+        int i, sad_test;
+        point_t primary_qpel, secondary_qpel, vdiag;
+
+        unsigned minsad1 = sad.cache[1];
+        unsigned minsad2 = sad.cache[3];
+        secondary_qpel = point(-1, 0);
+        primary_qpel = point(0, -1);
+        if (sad.cache[3] >= sad.cache[2])
+            primary_qpel = point(0, 1), minsad2 = sad.cache[2];
+        if (sad.cache[1] >= sad.cache[0])
+            secondary_qpel = point(1, 0), minsad1 = sad.cache[0];
+
+        if (minsad2 > minsad1)
+        {
+            SWAP(point_t, secondary_qpel, primary_qpel);
+        }
+
+        //     ============> primary
+        //     |00 01 02
+        //     |10 11 12
+        //     |20    22
+        //     V
+        //     secondary
+        vdiag = mv_add(primary_qpel, secondary_qpel);
+
+        for (i = 0; i < 7; i++)
+        {
+            pix_t *ptest;
+            switch(i)
+            {
+            case 0:
+                // 02 = interpolate primary half-pel
+                v = mv_add(*mv, mv_add(primary_qpel, primary_qpel));
+                interpolate_luma(ref, rowbytes, v, wh, ptest = hpel1);
+                break;
+            case 1:
+                // 01 q-pel = (00 + 02)/2
+                v = mv_add(*mv, primary_qpel);
+                h264e_qpel_average_wh_align(scratch, hpel1, ptest = hpel, wh);
+                break;
+            case 2:
+                // 20 = interpolate secondary half-pel
+                v = mv_add(*mv, mv_add(secondary_qpel, secondary_qpel));
+                interpolate_luma(ref, rowbytes, v, wh, ptest = hpel2);
+                break;
+            case 3:
+                // 10 q-pel = (00 + 20)/2
+                hpel  = scratch + store_bytes; if (pbest == hpel) hpel = scratch;
+                v = mv_add(*mv, secondary_qpel);
+                h264e_qpel_average_wh_align(scratch, hpel2, ptest = hpel, wh);
+                break;
+            case 4:
+                // 11 q-pel = (02 + 20)/2
+                hpel  = scratch + store_bytes; if (pbest == hpel) hpel = scratch;
+                v = mv_add(*mv, vdiag);
+                h264e_qpel_average_wh_align(hpel1, hpel2, ptest = hpel, wh);
+                break;
+            case 5:
+                // 22 = interpolate center half-pel
+                if (pbest == hpel2) hpel2 = scratch, hpel = scratch + store_bytes;
+                v = mv_add(*mv, mv_add(vdiag, vdiag));
+                interpolate_luma(ref, rowbytes, v, wh, ptest = hpel2);
+                break;
+            case 6:
+            default:
+                // 12 q-pel = (02 + 22)/2
+                hpel  = scratch + store_bytes; if (pbest == hpel) hpel = scratch;
+                v = mv_add(*mv, mv_add(primary_qpel, vdiag));
+                h264e_qpel_average_wh_align(hpel2, hpel1, ptest = hpel, wh);
+                break;
+            }
+
+            sad_test = h264e_sad_mb_unlaign_wh(ptest, 16, b, wh) + me_mv_cost(v, mv_pred, qp);
+            if (sad_test < min_sad)
+            {
+                min_sad = sad_test;
+                vbest = v;
+                pbest = ptest;
+            }
+        }
+
+        *mv = vbest;
+        *ppbest = pbest;
+    }
+    return min_sad;
+}
+
+/**
+*   Set range for MV search
+*/
+static void me_mv_set_range(point_t *pnt, rectangle_t *range, const rectangle_t *mv_limit, int mby)
+{
+    // clip start point
+    rectangle_t r = *mv_limit;
+    r.tl.s.y = (int16_t)(MAX(r.tl.s.y, mby - 63*4));
+    r.br.s.y = (int16_t)(MIN(r.br.s.y, mby + 63*4));
+    mv_clip(pnt, &r);
+    range->tl = mv_add(*pnt, point(-MV_RANGE*4, -MV_RANGE*4));
+    range->br = mv_add(*pnt, point(+MV_RANGE*4, +MV_RANGE*4));
+    // clip search range
+    mv_clip(&range->tl, &r);
+    mv_clip(&range->br, &r);
+}
+
+/**
+*   Remove duplicates from MV candidates list
+*/
+static int me_mv_refine_cand(point_t *p, int n)
+{
+    int i, j, k;
+    p[0] = mv_round_qpel(p[0]);
+    for (j = 1, k = 1; j < n; j++)
+    {
+        point_t mv = mv_round_qpel(p[j]);
+        for (i = 0; i < k; i++)
+        {
+            // TODO
+            //if (!mv_differs3(mv, p[i], 3*4))
+            //if (!mv_differs3(mv, p[i], 1*4))
+            //if (!mv_differs3(mv, p[i], 3))
+            if (mv_equal(mv, p[i]))
+                break;
+        }
+        if (i == k)
+            p[k++] = mv;
+    }
+    return k;
+}
+
+/**
+*   Choose candidates for inter MB partitioning (16x8,8x16 or 8x8),
+*   using SAD's for 8x8 sub-blocks
+*/
+static void mb_inter_partition(/*const */int sad[4], int mode[4])
+{
+/*
+    slope
+        |[ 1  1]| _ |[ 1 -1]|
+        |[-1 -1]|   |[ 1 -1]|
+        indicates v/h gradient: big negative = vertical prediction; big positive = horizontal
+
+    skew
+        |[ 1  0]| _ |[ 0 -1]|
+        |[ 0 -1]|   |[ 1  0]|
+        indicates diagonal gradient: big negative = diagonal down right
+*/
+    int p00 = sad[0];
+    int p01 = sad[1];
+    int p10 = sad[2];
+    int p11 = sad[3];
+    int sum = p00 + p01 + p10 + p11;
+    int slope = ABS((p00 - p10) + (p01 - p11)) - ABS((p00 - p01) + (p10 - p11));
+    int skew = ABS(p11 - p00) - ABS(p10 - p01);
+
+    if (slope >  (sum >> 4))
+    {
+        mode[1] = 1;    // try 8x16 partition
+    }
+    if (slope < -(sum >> 4))
+    {
+        mode[2] = 1;    // try 16x8 partition
+    }
+    if (ABS(skew) > (sum >> 4) && ABS(slope) <= (sum >> 4))
+    {
+        mode[3] = 1;    // try 8x8 partition
+    }
+}
+
+/**
+*   Online MV clustering to "long" and "short" clusters
+*   Estimate mean "long" and "short" vectors
+*/
+static void mv_clusters_update(h264e_enc_t *enc, point_t mv)
+{
+    int mv_norm = SQRP(mv);
+    int n0 = SQRP(enc->mv_clusters[0]);
+    int n1 = SQRP(enc->mv_clusters[1]);
+    if (mv_norm < n1)
+    {
+        // "short" is shorter than "long"
+        SMOOTH(enc->mv_clusters[0], mv);
+    }
+    if (mv_norm >= n0)
+    {
+        // "long" is longer than "short"
+        SMOOTH(enc->mv_clusters[1], mv);
+    }
+}
+
+/**
+*   Choose inter mode: skip/coded, ME partition, find MV
+*/
+static void inter_choose_mode(h264e_enc_t *enc)
+{
+    int prefered_modes[4] = { 1, 0, 0, 0 };
+    point_t mv_skip, mv_skip_a, mv_cand[MAX_MV_CAND];
+    point_t mv_pred_16x16 = me_mv_medianpredictor_get_skip(enc);
+    point_t mv_best = point(MV_NA, 0); // avoid warning
+
+    int sad, sad_skip = 0x7FFFFFFF, sad_best = 0x7FFFFFFF;
+    int off, i, j = 0, ncand = 0;
+    int cand_sad4[MAX_MV_CAND][4];
+    const pix_t *ref_yuv = enc->ref.yuv[0];
+    int ref_stride = enc->ref.stride[0];
+    int mv_cand_cost_best = 0;
+    mv_skip = enc->mb.mv_skip_pred;
+    mv_skip_a = mb_abs_mv(enc, mv_skip);
+
+    for (i = 0; i < 4; i++)
+    {
+        enc->df.df_mv[4 + 5*i].u32 = enc->mv_pred[i].u32;
+        enc->df.df_mv[i].u32       = enc->mv_pred[8 + 4*enc->mb.x + i].u32;
+    }
+
+    // Try skip mode
+    if (mv_in_rect(mv_skip_a, &enc->frame.mv_qpel_limit))
+    {
+        int *sad4 = cand_sad4[0];
+        interpolate_luma(ref_yuv, ref_stride, mv_skip_a, point(16, 16), enc->ptest);
+        sad_skip = h264e_sad_mb_unlaign_8x8(enc->scratch->mb_pix_inp, 16, enc->ptest, sad4);
+
+        if (MAX(MAX(sad4[0], sad4[1]), MAX(sad4[2], sad4[3])) < g_skip_thr_inter[enc->rc.qp])
+        {
+            int uv, sad_uv;
+
+            SWAP(pix_t*, enc->pbest, enc->ptest);
+            enc->mb.type = -1;
+            enc->mb.mv[0] = mv_skip;
+            enc->mb.cost = 0;
+            interpolate_chroma(enc, mv_skip_a);
+
+            // Check that chroma SAD is not too big for the skip
+            for (uv = 1; uv <= 2; uv++)
+            {
+                pix_t *pred = enc->ptest + (uv - 1)*8;
+                pix_t *pix_mb_uv = mb_input_chroma(enc, uv);
+                int inp_stride = enc->inp.stride[uv];
+
+                if (enc->frame.cropping_flag && ((enc->mb.x + 1)*16  > enc->param.width || (enc->mb.y + 1)*16  > enc->param.height))
+                {
+                    // Speculative read beyond frame borders: make local copy of the macroblock.
+                    // TODO: same code used in mb_write() and mb_encode()
+                    pix_copy_cropped_mb(enc->scratch->mb_pix_store, 8, pix_mb_uv, enc->inp.stride[uv],
+                        MIN(8, enc->param.width/2  - enc->mb.x*8),
+                        MIN(8, enc->param.height/2 - enc->mb.y*8));
+                    pix_mb_uv = enc->scratch->mb_pix_store;
+                    inp_stride = 8;
+                }
+
+                sad_uv = h264e_sad_mb_unlaign_wh(pix_mb_uv, inp_stride, pred, point(8, 8));
+                if (sad_uv >= g_skip_thr_inter[enc->rc.qp])
+                {
+                    break;
+                }
+            }
+            if (uv == 3)
+            {
+                return;
+            }
+        }
+
+        if (enc->run_param.encode_speed < 1) // enable 8x16, 16x8 and 8x8 partitions
+        {
+            mb_inter_partition(sad4, prefered_modes);
+        }
+
+        //sad_skip += me_mv_cost(mv_skip, mv_pred_16x16, enc->rc.qp);
+
+        // Too big skip SAD. Use skip predictor as a diamond start point candidate
+        mv_best = mv_cand[ncand++] = mv_round_qpel(mv_skip);
+        if (!((mv_skip.s.x | mv_skip.s.y) & 3))
+        {
+            sad_best = sad_skip;//+ me_mv_cost(mv_best, mv_pred_16x16, enc->rc.qp)
+            mv_cand_cost_best = me_mv_cand_cost(mv_skip, mv_pred_16x16, enc->rc.qp);
+            //mv_cand_cost_best = me_mv_cand_cost(mv_skip, point(0,0), enc->rc.qp);
+            j = 1;
+        }
+    }
+
+    mv_cand[ncand++] = mv_pred_16x16;
+    ncand += me_mv_medianpredictor_get_cand(enc, mv_cand + ncand);
+
+    if (enc->mb.x <= 0)
+    {
+        mv_cand[ncand++] = point(8*4, 0);
+    }
+    if (enc->mb.y <= 0)
+    {
+        mv_cand[ncand++] = point(0, 8*4);
+    }
+
+    mv_cand[ncand++] = enc->mv_clusters[0];
+    mv_cand[ncand++] = enc->mv_clusters[1];
+
+    assert(ncand <= MAX_MV_CAND);
+    ncand = me_mv_refine_cand(mv_cand, ncand);
+
+    for (/*j = 0*/; j < ncand; j++)
+    {
+        point_t mv = mb_abs_mv(enc, mv_cand[j]);
+        if (mv_in_rect(mv, &enc->frame.mv_limit))
+        {
+            int mv_cand_cost = me_mv_cand_cost(mv_cand[j], mv_pred_16x16, enc->rc.qp);
+
+            int *sad4 = cand_sad4[j];
+            off = ((mv.s.y + 0) >> 2)*ref_stride + ((mv.s.x + 0) >> 2);
+            sad = h264e_sad_mb_unlaign_8x8(ref_yuv + off, ref_stride, enc->scratch->mb_pix_inp, sad4);
+
+            if (enc->run_param.encode_speed < 1) // enable 8x16, 16x8 and 8x8 partitions
+            {
+                mb_inter_partition(sad4, prefered_modes);
+            }
+
+            if (sad + mv_cand_cost < sad_best + mv_cand_cost_best)
+            //if (sad < sad_best)
+            {
+                mv_cand_cost_best = mv_cand_cost;
+                sad_best = sad;
+                mv_best = mv_cand[j];
+            }
+        }
+    }
+
+    sad_best += me_mv_cost(mv_best, mv_pred_16x16, enc->rc.qp);
+
+    {
+        int mb_type;
+        point_t wh, part, mvpred_ctx[12], part_mv[4][16], part_mvd[4][16];
+        pix_t *store = enc->scratch->mb_pix_store;
+        pix_t *pred_best = store, *pred_test = store + 256;
+
+#define MAX8X8_MODES 4
+        me_mv_medianpredictor_save_ctx(enc, mvpred_ctx);
+        enc->mb.cost = 0xffffff;
+        for (mb_type = 0; mb_type < MAX8X8_MODES; mb_type++)
+        {
+            static const int nbits[4] = { 1, 4, 4, 12 };
+            int imv = 0;
+            int part_sad = MUL_LAMBDA(nbits[mb_type], g_lambda_q4[enc->rc.qp]);
+
+            if (!prefered_modes[mb_type]) continue;
+
+            wh.s.x = (mb_type & 2) ? 8 : 16;
+            wh.s.y = (mb_type & 1) ? 8 : 16;
+            part = point(0, 0);
+            for (;;)
+            {
+                rectangle_t range;
+                pix_t *diamond_out;
+                point_t mv, mv_pred, mvabs = mb_abs_mv(enc, mv_best);
+                me_mv_set_range(&mvabs, &range, &enc->frame.mv_limit, enc->mb.y*16*4 + part.s.y*4);
+
+                mv_pred = me_mv_medianpredictor_get(enc, part, wh);
+
+                if (mb_type)
+                {
+                    mvabs = mv_round_qpel(mb_abs_mv(enc, mv_pred));
+                    me_mv_set_range(&mvabs, &range, &enc->frame.mv_limit, enc->mb.y*16*4 + part.s.y*4);
+                    off = ((mvabs.s.y >> 2) + part.s.y)*ref_stride + ((mvabs.s.x >> 2) + part.s.x);
+                    sad_best = h264e_sad_mb_unlaign_wh(ref_yuv + off, ref_stride, enc->scratch->mb_pix_inp + part.s.y*16 + part.s.x, wh)
+                        + me_mv_cost(mvabs,
+                        //mv_pred,
+                        mb_abs_mv(enc, mv_pred),
+                        enc->rc.qp);
+                }
+
+                part_sad += me_search_diamond(enc, ref_yuv + part.s.y*ref_stride + part.s.x,
+                    enc->scratch->mb_pix_inp + part.s.y*16 + part.s.x, ref_stride, &mvabs, &range, enc->rc.qp,
+                    mb_abs_mv(enc, mv_pred), sad_best, wh,
+                    store, &diamond_out, mb_type ? (mb_type == 2 ? 8 : 128) : 256);
+
+                if (!mb_type)
+                {
+                    pred_test = diamond_out;
+                    if (pred_test < store + 2*256)
+                    {
+                        pred_best = (pred_test == store ? store + 256 : store);
+                        store += 2*256;
+                    } else
+                    {
+                        pred_best = (pred_test == (store + 512) ? store + 512 + 256 : store + 512);
+                    }
+                } else
+                {
+                    h264e_copy_8x8(pred_test + part.s.y*16 + part.s.x, 16, diamond_out);
+                    if (mb_type < 3)
+                    {
+                        int part_off = (wh.s.x >> 4)*8 + (wh.s.y >> 4)*8*16;
+                        h264e_copy_8x8(pred_test + part_off + part.s.y*16 + part.s.x, 16, diamond_out + part_off);
+                    }
+                }
+
+                mv = mv_sub(mvabs, point(enc->mb.x*16*4, enc->mb.y*16*4));
+
+                part_mvd[mb_type][imv] = mv_sub(mv, mv_pred);
+                part_mv[mb_type][imv++] = mv;
+
+                me_mv_medianpredictor_put(enc, part.s.x >> 2, part.s.y >> 2, wh.s.x >> 2, wh.s.y >> 2, mv);
+
+                part.s.x = (part.s.x + wh.s.x) & 15;
+                if (!part.s.x)
+                {
+                    part.s.y = (part.s.y + wh.s.y) & 15;
+                    if (!part.s.y) break;
+                }
+            }
+
+            me_mv_medianpredictor_restore_ctx(enc, mvpred_ctx);
+
+            if (part_sad < enc->mb.cost)
+            {
+                SWAP(pix_t*, pred_best, pred_test);
+                enc->mb.cost = part_sad;
+                enc->mb.type = mb_type;
+            }
+        }
+        enc->pbest = pred_best;
+        enc->ptest = pred_test;
+        memcpy(enc->mb.mv,  part_mv [enc->mb.type], 16*sizeof(point_t));
+        memcpy(enc->mb.mvd, part_mvd[enc->mb.type], 16*sizeof(point_t));
+
+        if (enc->mb.cost > sad_skip)
+        {
+            enc->mb.type = 0;
+            enc->mb.cost = sad_skip + me_mv_cand_cost(mv_skip, mv_pred_16x16, enc->rc.qp);
+            enc->mb.mv [0] = mv_skip;
+            enc->mb.mvd[0] = mv_sub(mv_skip, mv_pred_16x16);
+
+            assert(mv_in_rect(mv_skip_a, &enc->frame.mv_qpel_limit)) ;
+            interpolate_luma(ref_yuv, ref_stride, mv_skip_a, point(16, 16), enc->pbest);
+            interpolate_chroma(enc, mv_skip_a);
+        }
+    }
+}
+
+/************************************************************************/
 /*      Deblock filter                                                  */
 /************************************************************************/
 #define MB_FLAG_SLICE_START_DEBLOCK_2 2
@@ -3476,6 +4681,11 @@ static void mb_encode(h264e_enc_t* enc)
     enc->mb.type = 0;   // P16x16
     enc->mb.cost = 0x7FFFFFFF;
 
+    if (enc->slice.type == SLICE_TYPE_P)
+    {
+        inter_choose_mode(enc);
+    }
+
     if (enc->mb.type >= 0)
     {
         intra_choose_16x16(enc, left, top, avail);
@@ -3487,8 +4697,7 @@ static void mb_encode(h264e_enc_t* enc)
 
     if (enc->mb.type < 5)
     {
-        assert(0);
-        //mv_clusters_update(enc, enc->mb.mv[0]);
+        mv_clusters_update(enc, enc->mb.mv[0]);
     }
 
     if (enc->mb.type >= 5)
@@ -3498,8 +4707,7 @@ static void mb_encode(h264e_enc_t* enc)
     }
     else
     {
-        assert(0);
-        //interpolate_chroma(enc, mb_abs_mv(enc, enc->mb.mv[0]));
+        interpolate_chroma(enc, mb_abs_mv(enc, enc->mb.mv[0]));
     }
 
     mb_write(enc);
@@ -3715,9 +4923,8 @@ static int enc_alloc(h264e_enc_t* enc, const H264E_create_param_t* par, unsigned
     unsigned char* p0 = p;
     int nmbx = (par->width + 15) >> 4;
     int nmby = (par->height + 15) >> 4;
-    //int nref_frames = 1 + 0 + 1;
-    //ALLOC(enc->ref.yuv[0], ((nmbx + 2) * (nmby + 2) * 384) * nref_frames);
-    ALLOC(enc->dec.yuv[0], ((nmbx + 2) * (nmby + 2) * 384));
+    int nref_frames = 1 + 0 + 1;
+    ALLOC(enc->ref.yuv[0], ((nmbx + 2) * (nmby + 2) * 384) * nref_frames);
     return (int)((p - p0) + 15) & ~15u;
 }
 
@@ -3772,7 +4979,7 @@ int H264E_sizeof(const H264E_create_param_t* par, int* sizeof_persist, int* size
 
 static int H264E_init_one(h264e_enc_t* enc, const H264E_create_param_t* opt)
 {
-    //pix_t* base;
+    pix_t* base;
 #if H264E_CONFIGS_COUNT > 1
     init_vft(opt->enableNEON);
 #endif
@@ -3783,22 +4990,17 @@ static int H264E_init_one(h264e_enc_t* enc, const H264E_create_param_t* opt)
     enc->frame.nmb = enc->frame.nmbx * enc->frame.nmby;
     enc->frame.w = enc->frame.nmbx * 16;
     enc->frame.h = enc->frame.nmby * 16;
-    //enc->frame.mv_limit.tl = point(-MV_GUARD * 4, -MV_GUARD * 4);
-    //enc->frame.mv_qpel_limit.tl = mv_add(enc->frame.mv_limit.tl, point(4 * 4, 4 * 4));
-    //enc->frame.mv_limit.br = point((enc->frame.nmbx * 16 - (16 - MV_GUARD)) * 4, (enc->frame.nmby * 16 - (16 - MV_GUARD)) * 4);
-    //enc->frame.mv_qpel_limit.br = mv_add(enc->frame.mv_limit.br, point(-4 * 4, -4 * 4));
+    enc->frame.mv_limit.tl = point(-MV_GUARD * 4, -MV_GUARD * 4);
+    enc->frame.mv_qpel_limit.tl = mv_add(enc->frame.mv_limit.tl, point(4 * 4, 4 * 4));
+    enc->frame.mv_limit.br = point((enc->frame.nmbx * 16 - (16 - MV_GUARD)) * 4, (enc->frame.nmby * 16 - (16 - MV_GUARD)) * 4);
+    enc->frame.mv_qpel_limit.br = mv_add(enc->frame.mv_limit.br, point(-4 * 4, -4 * 4));
     enc->frame.cropping_flag = !!((opt->width | opt->height) & 15);
     enc->param = *opt;
 
     enc_alloc(enc, opt, (void*)(enc + 1));
 
-    //base = io_yuv_set_pointers(enc->ref.yuv[0], &enc->ref, enc->frame.nmbx * 16, enc->frame.nmby * 16);
-    //if (enc->param.const_input_flag)
-    //{
-    //    base = io_yuv_set_pointers(base, &enc->dec, enc->frame.nmbx * 16, enc->frame.nmby * 16);
-    //}
-
-    io_yuv_set_pointers(enc->dec.yuv[0], &enc->dec, enc->frame.nmbx * 16, enc->frame.nmby * 16);
+    base = io_yuv_set_pointers(enc->ref.yuv[0], &enc->ref, enc->frame.nmbx * 16, enc->frame.nmby * 16);
+    base = io_yuv_set_pointers(base, &enc->dec, enc->frame.nmbx * 16, enc->frame.nmby * 16);
 
     return H264E_STATUS_SUCCESS;
 }
@@ -3820,7 +5022,8 @@ int H264E_init(H264E_persist_t* enc, const H264E_create_param_t* opt)
 static int H264E_encode_one(H264E_persist_t* enc, const H264E_run_param_t* opt, int frame_type, int pps_id)
 {
     // slice reset
-    enc->slice.type = SLICE_TYPE_I;
+    // TODO: slice type should be coming from std slice header structure
+    enc->slice.type = frame_type == H264E_FRAME_TYPE_P ? SLICE_TYPE_P : SLICE_TYPE_I;
     rc_frame_start(enc);
     //enc->slice.type = (long_term_idx_use < 0 ? SLICE_TYPE_I : SLICE_TYPE_P);
     //rc_frame_start(enc, (long_term_idx_use < 0) ? 1 : 0, is_refers_to_long_term);
@@ -3831,7 +5034,7 @@ static int H264E_encode_one(H264E_persist_t* enc, const H264E_run_param_t* opt, 
 
     //rc_frame_end(enc, long_term_idx_use == -1, enc->mb.skip_run == enc->frame.nmb, is_refers_to_long_term);
 
-    //pix_copy_recon_pic_to_ref(enc);
+    pix_copy_recon_pic_to_ref(enc);
 
     ++enc->frame.num;
 

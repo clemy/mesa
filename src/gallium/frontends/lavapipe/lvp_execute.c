@@ -4810,7 +4810,7 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
          run_param.frame_type = H264E_FRAME_TYPE_I;
          break;
       case STD_VIDEO_H264_PICTURE_TYPE_P:
-         run_param.frame_type = H264E_FRAME_TYPE_I;
+         run_param.frame_type = H264E_FRAME_TYPE_P;
          break;
       default:
          /* not implemented */
