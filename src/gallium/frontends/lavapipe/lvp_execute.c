@@ -4797,9 +4797,26 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    yuv.yuv[2] = data_v;
    yuv.stride[2] = src_box_uv.width;
 
+   struct VkVideoEncodeH264PictureInfoKHR *pic_info = vk_find_struct(encode_video->encode_info, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
+
    H264E_run_param_t run_param;
    run_param.encode_speed = H264E_SPEED_SLOWEST;
-   run_param.frame_type = video_session->image_num == 0 ? H264E_FRAME_TYPE_KEY : H264E_FRAME_TYPE_I;
+   switch (pic_info->pStdPictureInfo->primary_pic_type) {
+      case STD_VIDEO_H264_PICTURE_TYPE_IDR:
+         assert(pic_info->pStdPictureInfo->flags.IdrPicFlag);
+         run_param.frame_type = H264E_FRAME_TYPE_KEY;
+         break;
+      case STD_VIDEO_H264_PICTURE_TYPE_I:
+         run_param.frame_type = H264E_FRAME_TYPE_I;
+         break;
+      case STD_VIDEO_H264_PICTURE_TYPE_P:
+         run_param.frame_type = H264E_FRAME_TYPE_I;
+         break;
+      default:
+         /* not implemented */
+         assert(0);
+         break;
+   }
    run_param.qp = 33; // TODO: get initial QP from SPS and set to enc->sps.pic_init_qp
 
    uint8_t* coded_data;
@@ -4816,11 +4833,11 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    free(data_u);
    free(data_v);
 
-   /* TODO: replace with encoded bitstream. Try to set some values in the destination buffer.. */
    uint32_t *dst;
    struct pipe_transfer *dst_t;
    struct pipe_box dst_box;
 
+   // TODO: handle encode_video->encode_info->dstBufferOffset & encode_video->encode_info->dstBufferRange
    u_box_1d(0, sizeof_coded_data, &dst_box);
    dst = state->pctx->buffer_map(state->pctx,
                                    dst_buffer->bo,
@@ -4844,8 +4861,6 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
          *data++ = 0;
       *data = error == H264E_STATUS_SUCCESS ? VK_QUERY_RESULT_STATUS_COMPLETE_KHR : VK_QUERY_RESULT_STATUS_ERROR_KHR;
    }
-
-   video_session->image_num++;
 }
 
 static void
