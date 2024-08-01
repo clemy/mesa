@@ -4817,7 +4817,7 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
          assert(0);
          break;
    }
-   run_param.qp = 33; // TODO: get initial QP from SPS and set to enc->sps.pic_init_qp
+   run_param.qp = 26; // TODO: get initial QP from SPS and set to enc->sps.pic_init_qp
 
    uint8_t* coded_data;
    int sizeof_coded_data = 0;
