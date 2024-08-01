@@ -19,7 +19,7 @@
 */
 #define H264E_FRAME_TYPE_KEY        6       // Random access point: SPS+PPS+Intra frame
 #define H264E_FRAME_TYPE_I          5       // Intra frame: updates long & short-term reference
-//#define H264E_FRAME_TYPE_P          2       // Use and update short-term reference
+#define H264E_FRAME_TYPE_P          2       // Use and update short-term reference
 
 /**
 *   Speed preset index.
