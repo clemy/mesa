@@ -627,6 +627,8 @@ struct lvp_video_session {
 
 struct lvp_video_session_params {
    struct vk_video_session_parameters vk;
+   bool has_sps_overides;
+   bool has_pps_overides;
 };
 
 struct lvp_cmd_buffer {

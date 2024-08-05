@@ -14,6 +14,20 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
 {
    //VK_FROM_HANDLE(lvp_physical_device, pdev, physicalDevice);
 
+   if (pVideoProfile->videoCodecOperation != VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR)
+      return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+
+   if (pVideoProfile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR ||
+       pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR ||
+       pVideoProfile->chromaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+      return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+
+   const struct VkVideoEncodeH264ProfileInfoKHR *h264_profile =
+      vk_find_struct_const(pVideoProfile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
+
+   if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
+      return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+
    pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
    pCapabilities->pictureAccessGranularity.width = LVP_MACROBLOCK_WIDTH;
    pCapabilities->pictureAccessGranularity.height = LVP_MACROBLOCK_HEIGHT;
@@ -28,38 +42,31 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
 
    if (enc_caps) {
       enc_caps->flags = 0;
-      enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR |
-                                    VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR |
-                                    VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR;
+      // TODO: support rate control beside default
+      //enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR |
+      //                              VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR |
+      //                              VK_VIDEO_ENCODE_RATE_CONTROL_MODE_VBR_BIT_KHR;
+      enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
       enc_caps->maxRateControlLayers = LVP_ENC_MAX_RATE_LAYER;
       enc_caps->maxBitrate = 1000000000;
-      enc_caps->maxQualityLevels = 2;
+      enc_caps->maxQualityLevels = 1;
       enc_caps->encodeInputPictureGranularity.width = 1;
       enc_caps->encodeInputPictureGranularity.height = 1;
       enc_caps->supportedEncodeFeedbackFlags = VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR |
                                                 VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR;
+      // TODO: support VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR
+      // TODO: support STATUS only queries
    }
    pCapabilities->minBitstreamBufferOffsetAlignment = 16;
    pCapabilities->minBitstreamBufferSizeAlignment = 16;
+   pCapabilities->maxDpbSlots = NUM_H2645_REFS + 1;
+   pCapabilities->maxActiveReferencePictures = NUM_H2645_REFS;
    
-   switch (pVideoProfile->videoCodecOperation) {
-   case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR: {
-      struct VkVideoEncodeH264CapabilitiesKHR *ext = (struct VkVideoEncodeH264CapabilitiesKHR *)vk_find_struct(
-         pCapabilities->pNext, VIDEO_ENCODE_H264_CAPABILITIES_KHR);
+   struct VkVideoEncodeH264CapabilitiesKHR *ext = (struct VkVideoEncodeH264CapabilitiesKHR *)vk_find_struct(
+      pCapabilities->pNext, VIDEO_ENCODE_H264_CAPABILITIES_KHR);
 
-      const struct VkVideoEncodeH264ProfileInfoKHR *h264_profile =
-         vk_find_struct_const(pVideoProfile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
-
-      if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
-         return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
-
-      if (pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
-         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
-
-      pCapabilities->maxDpbSlots = NUM_H2645_REFS;
-      pCapabilities->maxActiveReferencePictures = NUM_H2645_REFS;
-      ext->flags = VK_VIDEO_ENCODE_H264_CAPABILITY_HRD_COMPLIANCE_BIT_KHR |
-                   VK_VIDEO_ENCODE_H264_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
+   if (ext) {
+      ext->flags = VK_VIDEO_ENCODE_H264_CAPABILITY_PER_PICTURE_TYPE_MIN_MAX_QP_BIT_KHR;
       ext->maxLevelIdc = STD_VIDEO_H264_LEVEL_IDC_6_2;
       ext->maxSliceCount = 1;
       ext->maxPPictureL0ReferenceCount = 1;
@@ -71,18 +78,11 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
       ext->maxQp = 51;
       ext->prefersGopRemainingFrames = false;
       ext->requiresGopRemainingFrames = false;
-      ext->stdSyntaxFlags = VK_VIDEO_ENCODE_H264_STD_CONSTRAINED_INTRA_PRED_FLAG_SET_BIT_KHR |
-                            VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_UNSET_BIT_KHR |
-                            VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR |
-                            VK_VIDEO_ENCODE_H264_STD_WEIGHTED_BIPRED_IDC_EXPLICIT_BIT_KHR;
+      ext->stdSyntaxFlags = VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_UNSET_BIT_KHR;
+   }
 
-      strcpy(pCapabilities->stdHeaderVersion.extensionName, VK_STD_VULKAN_VIDEO_CODEC_H264_ENCODE_EXTENSION_NAME);
-      pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_H264_ENCODE_SPEC_VERSION;
-      break;
-   }
-   default:
-      break;
-   }
+   strcpy(pCapabilities->stdHeaderVersion.extensionName, VK_STD_VULKAN_VIDEO_CODEC_H264_ENCODE_EXTENSION_NAME);
+   pCapabilities->stdHeaderVersion.specVersion = VK_STD_VULKAN_VIDEO_CODEC_H264_ENCODE_SPEC_VERSION;
 
    return VK_SUCCESS;
 }
@@ -93,64 +93,86 @@ lvp_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
                                                uint32_t *pVideoFormatPropertyCount,
                                                VkVideoFormatPropertiesKHR *pVideoFormatProperties)
 {
-   /* TODO: check if we require separate allocates for DPB and decode video. */
-   if ((pVideoFormatInfo->imageUsage &
-        (VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR)) ==
-       (VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR | VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   const struct VkVideoProfileListInfoKHR *video_profile_list = vk_find_struct_const(pVideoFormatInfo->pNext, VIDEO_PROFILE_LIST_INFO_KHR);
+   for (unsigned p = 0; p < video_profile_list->profileCount; p++) {
+      const VkVideoProfileInfoKHR *video_profile = video_profile_list->pProfiles + p;
+      if (video_profile->videoCodecOperation != VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR)
+         return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+
+      if (video_profile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR ||
+            video_profile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR ||
+            video_profile->chromaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+         return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+
+      const VkVideoEncodeH264ProfileInfoKHR *h264_profile =
+         vk_find_struct_const(video_profile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
+      if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
+         return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+   }
+
+   // DPB pictures do not support any other usages
+   if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR && pVideoFormatInfo->imageUsage != VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR)
+      return VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR;
+   // picture must be either DPB or SRC
+   if (!(pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR || pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR))
+      return VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR;
+
 
    VK_OUTARRAY_MAKE_TYPED(VkVideoFormatPropertiesKHR, out, pVideoFormatProperties, pVideoFormatPropertyCount);
-
-   bool need_8bit = true;
-   bool need_10bit = false;
-   const struct VkVideoProfileListInfoKHR *prof_list =
-      (struct VkVideoProfileListInfoKHR *)vk_find_struct_const(pVideoFormatInfo->pNext, VIDEO_PROFILE_LIST_INFO_KHR);
-   if (prof_list) {
-      for (unsigned i = 0; i < prof_list->profileCount; i++) {
-         const VkVideoProfileInfoKHR *profile = &prof_list->pProfiles[i];
-         if (profile->lumaBitDepth & VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
-            need_10bit = true;
-      }
-   }
-
-   if (need_10bit) {
-      vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p)
-      {
-         p->format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
-         p->componentMapping.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->componentMapping.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->componentMapping.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->componentMapping.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->imageCreateFlags = 0;
-         if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)
-            p->imageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-         p->imageType = VK_IMAGE_TYPE_2D;
-         p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
-         p->imageUsageFlags = pVideoFormatInfo->imageUsage;
-      }
-
-      if (pVideoFormatInfo->imageUsage & (VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR))
-         need_8bit = false;
-   }
-
-   if (need_8bit) {
-      vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p)
-      {
-         p->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-         p->componentMapping.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->componentMapping.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->componentMapping.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->componentMapping.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-         p->imageCreateFlags = 0;
-         if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)
-            p->imageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-         p->imageType = VK_IMAGE_TYPE_2D;
-         p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
-         p->imageUsageFlags = pVideoFormatInfo->imageUsage;
-      }
+   vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p)
+   {
+      p->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+      p->componentMapping.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+      p->componentMapping.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+      p->componentMapping.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+      p->componentMapping.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+      p->imageCreateFlags = 0;
+      //if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)
+      //   p->imageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+      p->imageType = VK_IMAGE_TYPE_2D;
+      p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
+      p->imageUsageFlags = pVideoFormatInfo->imageUsage;
    }
 
    return vk_outarray_status(&out);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+lvp_GetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR(VkPhysicalDevice physicalDevice,
+   const VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR* pQualityLevelInfo,
+   VkVideoEncodeQualityLevelPropertiesKHR* pQualityLevelProperties)
+{
+   if (pQualityLevelInfo->pVideoProfile->videoCodecOperation != VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR)
+      return VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+
+   if (pQualityLevelInfo->pVideoProfile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR ||
+         pQualityLevelInfo->pVideoProfile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR ||
+         pQualityLevelInfo->pVideoProfile->chromaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+      return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+
+   const VkVideoEncodeH264ProfileInfoKHR *h264_profile =
+      vk_find_struct_const(pQualityLevelInfo->pVideoProfile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
+   if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
+      return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+
+   pQualityLevelProperties->preferredRateControlLayerCount = 0;
+   pQualityLevelProperties->preferredRateControlMode = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+
+   VkVideoEncodeH264QualityLevelPropertiesKHR *h264_properties =
+      vk_find_struct(pQualityLevelProperties->pNext, VIDEO_ENCODE_H264_QUALITY_LEVEL_PROPERTIES_KHR);
+   h264_properties->preferredRateControlFlags = VK_VIDEO_ENCODE_H264_RATE_CONTROL_REGULAR_GOP_BIT_KHR | VK_VIDEO_ENCODE_H264_RATE_CONTROL_REFERENCE_PATTERN_FLAT_BIT_KHR;
+   h264_properties->preferredGopFrameCount = 30;
+   h264_properties->preferredIdrPeriod = 30;
+   h264_properties->preferredConsecutiveBFrameCount = 0;
+   h264_properties->preferredTemporalLayerCount = 0;
+   h264_properties->preferredConstantQp.qpI = 25;
+   h264_properties->preferredConstantQp.qpP = 28;
+   h264_properties->preferredConstantQp.qpB = 31;
+   h264_properties->preferredMaxL0ReferenceCount = 1;
+   h264_properties->preferredMaxL1ReferenceCount = 0;
+   h264_properties->preferredStdEntropyCodingModeFlag = VK_FALSE;
+
+   return VK_SUCCESS;
 }
 
 VkResult
@@ -276,6 +298,24 @@ lvp_CreateVideoSessionParametersKHR(VkDevice _device,
       return result;
    }
 
+   params->has_sps_overides = false;
+   params->has_pps_overides = false;
+   for (uint32_t i = 0; i < params->vk.h264_enc.h264_sps_count; ++i) {
+      StdVideoH264SequenceParameterSet *sps = &params->vk.h264_enc.h264_sps[i].base;
+      // TODO: replace example override with correct SPS overrides
+      if (!sps->flags.constraint_set1_flag) {
+         sps->flags.constraint_set1_flag = 1u;
+         params->has_sps_overides = true;
+      }
+   }
+
+   for (uint32_t i = 0; i < params->vk.h264_enc.h264_pps_count; ++i) {
+      StdVideoH264PictureParameterSet *pps = &params->vk.h264_enc.h264_pps[i].base;
+      // TODO: replace example override with correct PPS overrides
+      pps;
+      //params->has_pps_overides = true;
+   }
+
    *pVideoSessionParameters = lvp_video_session_params_to_handle(params);
    return VK_SUCCESS;
 }
@@ -291,6 +331,15 @@ lvp_DestroyVideoSessionParametersKHR(VkDevice _device, VkVideoSessionParametersK
 
    vk_video_session_parameters_finish(&device->vk, &params->vk);
    vk_free2(&device->vk.alloc, pAllocator, params);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+lvp_UpdateVideoSessionParametersKHR(VkDevice _device, VkVideoSessionParametersKHR _params,
+                                      const VkVideoSessionParametersUpdateInfoKHR* pUpdateInfo)
+{
+   // TODO: implement
+   assert(0);
+   return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -349,6 +398,17 @@ lvp_GetEncodedVideoSessionParametersKHR(VkDevice device,
    }
    default:
       break;
+   }
+
+   if (pFeedbackInfo) {
+      pFeedbackInfo->hasOverrides = templ->has_sps_overides || templ->has_pps_overides;
+
+      struct VkVideoEncodeH264SessionParametersFeedbackInfoKHR  *h264_feedback_info =
+         vk_find_struct(pFeedbackInfo->pNext, VIDEO_ENCODE_H264_SESSION_PARAMETERS_FEEDBACK_INFO_KHR);
+      if (h264_feedback_info) {
+         h264_feedback_info->hasStdSPSOverrides = templ->has_sps_overides;
+         h264_feedback_info->hasStdPPSOverrides = templ->has_pps_overides;
+      }
    }
 
    *pDataSize = total_size;
