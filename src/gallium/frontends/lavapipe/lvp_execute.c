@@ -4701,6 +4701,7 @@ handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_sta
    //printf("Control: %u\n", control_video_coding->coding_control_info->flags);
 
    /* TODO: Update video session parameters */
+   /* TODO: Handle reset */
 }
 
 static void

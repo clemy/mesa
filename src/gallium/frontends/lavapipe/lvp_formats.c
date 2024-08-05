@@ -227,6 +227,10 @@ lvp_physical_device_get_format_properties(struct lvp_physical_device *physical_d
       break;
    }
 
+   if (format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+      features |= (VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR |
+                   VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR);
+
    out_properties->linearTilingFeatures = features;
    out_properties->optimalTilingFeatures = features;
    out_properties->bufferFeatures = buffer_features;
@@ -300,6 +304,7 @@ static VkResult lvp_get_image_format_properties(struct lvp_physical_device *phys
    uint32_t maxMipLevels;
    uint32_t maxArraySize;
    VkSampleCountFlags sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+   VkResult result = VK_ERROR_FORMAT_NOT_SUPPORTED;
    enum pipe_format pformat = lvp_vk_format_to_pipe_format(info->format);
    lvp_physical_device_get_format_properties(physical_device, info->format,
                                              &format_props);
@@ -349,6 +354,43 @@ static VkResult lvp_get_image_format_properties(struct lvp_physical_device *phys
       maxMipLevels = util_logbase2(max_2d_ext) + 1;
       maxArraySize = 1;
       break;
+   }
+
+   const VkVideoProfileListInfoKHR *video_profile_list =
+   vk_find_struct_const(info->pNext, VIDEO_PROFILE_LIST_INFO_KHR);
+   if (video_profile_list) {
+      for (unsigned p = 0; p < video_profile_list->profileCount; p++) {
+         const VkVideoProfileInfoKHR *video_profile = video_profile_list->pProfiles + p;
+         if (video_profile->videoCodecOperation != VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR) {
+            result = VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR;
+            goto unsupported;
+         }
+         if (video_profile->chromaSubsampling != VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR ||
+             video_profile->lumaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR ||
+             video_profile->chromaBitDepth != VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR) {
+            result = VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+            goto unsupported;
+         }
+         const VkVideoEncodeH264ProfileInfoKHR *video_profile_list =
+            vk_find_struct_const(video_profile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
+         if (video_profile_list->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE) {
+            result = VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
+            goto unsupported;
+         }
+      }
+      // DPB pictures do not support any other usages
+      if (info->usage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR && info->usage != VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR) {
+         result = VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR;
+         goto unsupported;
+      }
+      // picture must be either DPB or SRC
+      if (!(info->usage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR || info->usage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)) {
+         result = VK_ERROR_IMAGE_USAGE_NOT_SUPPORTED_KHR;
+         goto unsupported;
+      }
+
+      // TODO: check image creation flags for compatibility (maybe VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, maybe VK_IMAGE_CREATE_EXTENDED_USAGE_BIT ?)
+      //if (info->flags...
    }
 
    if (info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)
@@ -419,7 +461,7 @@ skip_checks:
       .maxResourceSize = 0,
    };
 
-   return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL lvp_GetPhysicalDeviceImageFormatProperties2(
