@@ -231,7 +231,7 @@ lvp_physical_device_get_format_properties(struct lvp_physical_device *physical_d
       features |= (VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR |
                    VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR);
    if (format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
-      features |= (VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR |
+      features |= (/*VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR |*/
                    VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR);
 
    out_properties->linearTilingFeatures = features;

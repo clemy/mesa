@@ -41,7 +41,7 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
       (struct VkVideoEncodeCapabilitiesKHR *)vk_find_struct(pCapabilities->pNext, VIDEO_ENCODE_CAPABILITIES_KHR);
 
    if (enc_caps) {
-      enc_caps->flags = 0;
+      enc_caps->flags = VK_VIDEO_ENCODE_CAPABILITY_INSUFFICIENT_BITSTREAM_BUFFER_RANGE_DETECTION_BIT_KHR;
       // TODO: support rate control beside default
       //enc_caps->rateControlModes = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR |
       //                              VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR |
@@ -135,6 +135,8 @@ lvp_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
          p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
          p->imageUsageFlags = pVideoFormatInfo->imageUsage;
       }
+      if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR)
+         break;
    }
    return vk_outarray_status(&out);
 }
