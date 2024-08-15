@@ -119,21 +119,23 @@ lvp_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
 
 
    VK_OUTARRAY_MAKE_TYPED(VkVideoFormatPropertiesKHR, out, pVideoFormatProperties, pVideoFormatPropertyCount);
-   vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p)
-   {
-      p->format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
-      p->componentMapping.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-      p->componentMapping.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-      p->componentMapping.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-      p->componentMapping.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-      p->imageCreateFlags = 0;
-      //if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)
-      //   p->imageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-      p->imageType = VK_IMAGE_TYPE_2D;
-      p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
-      p->imageUsageFlags = pVideoFormatInfo->imageUsage;
+   const VkFormat supportedFormats[] = {VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM};
+   for (int i = 0; i < sizeof(supportedFormats) / sizeof(supportedFormats[0]); ++i) {
+      vk_outarray_append_typed(VkVideoFormatPropertiesKHR, &out, p)
+      {
+         p->format = supportedFormats[i];
+         p->componentMapping.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+         p->componentMapping.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+         p->componentMapping.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+         p->componentMapping.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+         p->imageCreateFlags = 0;
+         if (pVideoFormatInfo->imageUsage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)
+            p->imageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+         p->imageType = VK_IMAGE_TYPE_2D;
+         p->imageTiling = VK_IMAGE_TILING_OPTIMAL;
+         p->imageUsageFlags = pVideoFormatInfo->imageUsage;
+      }
    }
-
    return vk_outarray_status(&out);
 }
 
@@ -211,10 +213,26 @@ lvp_CreateVideoSessionKHR(VkDevice _device,
       return VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR;
    }
    printf("sizeof_persist = %d sizeof_scratch = %d\n", sizeof_persist, sizeof_scratch);
+   if (pCreateInfo->pictureFormat == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+   {
+      // allocate memory for splitting UV planes
+      int sizeof_split_buffers = (pCreateInfo->maxCodedExtent.width / 2 * pCreateInfo->maxCodedExtent.height / 2) * 2;
+      printf("sizeof_split_buffers = %d\n", sizeof_split_buffers);
+      vid->split_buffers = vk_alloc2(&device->vk.alloc, pAllocator, sizeof_split_buffers, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!vid->split_buffers)
+      {
+         vk_free2(&device->vk.alloc, pAllocator, vid);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+   }
+   else {
+      vid->split_buffers = NULL;
+   }
    vid->enc = vk_alloc2(&device->vk.alloc, pAllocator, sizeof_persist, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    vid->scratch = vk_alloc2(&device->vk.alloc, pAllocator, sizeof_scratch, 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!vid->enc || !vid->scratch)
    {
+      vk_free2(&device->vk.alloc, pAllocator, vid->split_buffers);
       vk_free2(&device->vk.alloc, pAllocator, vid->enc);
       vk_free2(&device->vk.alloc, pAllocator, vid->scratch);
       vk_free2(&device->vk.alloc, pAllocator, vid);
@@ -224,6 +242,7 @@ lvp_CreateVideoSessionKHR(VkDevice _device,
    if (error)
    {
       printf("H264E_init error = %d\n", error);
+      vk_free2(&device->vk.alloc, pAllocator, vid->split_buffers);
       vk_free2(&device->vk.alloc, pAllocator, vid->enc);
       vk_free2(&device->vk.alloc, pAllocator, vid->scratch);
       vk_free2(&device->vk.alloc, pAllocator, vid);
@@ -242,6 +261,7 @@ lvp_DestroyVideoSessionKHR(VkDevice _device, VkVideoSessionKHR _session, const V
    if (!_session)
       return;
 
+   vk_free2(&device->vk.alloc, pAllocator, vid->split_buffers);
    vk_free2(&device->vk.alloc, pAllocator, vid->enc);
    vk_free2(&device->vk.alloc, pAllocator, vid->scratch);
 
