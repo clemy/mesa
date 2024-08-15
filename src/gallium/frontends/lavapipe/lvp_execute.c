@@ -4705,6 +4705,117 @@ handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_sta
 }
 
 static void
+map_image_to_ioyuv(struct rendering_state *state, const VkVideoPictureResourceInfoKHR *pic, enum pipe_map_flags map_flags, H264E_io_yuv_t *yuv, struct pipe_transfer *transfers[3])
+{
+   const struct lvp_image_view *image_view = lvp_image_view_from_handle(pic->imageViewBinding);
+   const struct lvp_image *image = image_view->image;
+   assert(image->plane_count == 3);
+   assert(image->vk.format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM);
+
+   struct pipe_box box;
+   box.x = pic->codedOffset.x;
+   box.y = pic->codedOffset.y;
+   box.z = image_view->vk.base_array_layer + pic->baseArrayLayer;
+   box.width = pic->codedExtent.width;
+   box.height = pic->codedExtent.height;
+   box.depth = 1;
+   
+   const VkImageAspectFlagBits planes[] = {
+      VK_IMAGE_ASPECT_PLANE_0_BIT,
+      VK_IMAGE_ASPECT_PLANE_1_BIT,
+      VK_IMAGE_ASPECT_PLANE_2_BIT,
+   };
+   for (int p = 0; p < 3; ++p) {
+      uint8_t plane = lvp_image_aspects_to_plane(image, planes[p]);
+      assert(image->planes[plane].bo->format == PIPE_FORMAT_R8_UNORM);
+      yuv->yuv[p] = state->pctx->texture_map(state->pctx,
+                                             image->planes[plane].bo,
+                                             0,
+                                             map_flags,
+                                             &box,
+                                             &transfers[p]);
+      yuv->stride[p] = transfers[p]->stride;
+
+      box.x = pic->codedOffset.x / 2;
+      box.y = pic->codedOffset.y / 2;
+      box.width = pic->codedExtent.width / 2;
+      box.height = pic->codedExtent.height / 2;
+   }
+}
+
+static void
+convert_image_to_ioyuv(struct rendering_state *state, const VkVideoPictureResourceInfoKHR *pic, H264E_io_yuv_t *yuv, struct pipe_transfer *transfers[3])
+{
+   const struct lvp_image_view *image_view = lvp_image_view_from_handle(pic->imageViewBinding);
+   const struct lvp_image *image = image_view->image;
+   assert(image->plane_count == 2);
+   assert(image->vk.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM);
+   struct lvp_video_session* video_session = state->video_encode.active_video_session;
+   assert(video_session->split_buffers);
+
+   struct pipe_box box;
+   box.x = pic->codedOffset.x;
+   box.y = pic->codedOffset.y;
+   box.z = image_view->vk.base_array_layer + pic->baseArrayLayer;
+   box.width = pic->codedExtent.width;
+   box.height = pic->codedExtent.height;
+   box.depth = 1;
+   
+   uint8_t plane = lvp_image_aspects_to_plane(image, VK_IMAGE_ASPECT_PLANE_0_BIT);
+   assert(image->planes[plane].bo->format == PIPE_FORMAT_R8_UNORM);
+   yuv->yuv[0] = state->pctx->texture_map(state->pctx,
+                                          image->planes[plane].bo,
+                                          0,
+                                          PIPE_MAP_READ,
+                                          &box,
+                                          &transfers[0]);
+   yuv->stride[0] = transfers[0]->stride;
+
+   box.x = pic->codedOffset.x / 2;
+   box.y = pic->codedOffset.y / 2;
+   box.width = pic->codedExtent.width / 2;
+   box.height = pic->codedExtent.height / 2;
+
+   plane = lvp_image_aspects_to_plane(image, VK_IMAGE_ASPECT_PLANE_1_BIT);
+   assert(image->planes[plane].bo->format == PIPE_FORMAT_R8G8_UNORM);
+
+   size_t size = box.width * box.height;
+   yuv->yuv[1] = video_session->split_buffers;
+   yuv->stride[1] = box.width;
+   yuv->yuv[2] = video_session->split_buffers + size;
+   yuv->stride[2] = box.width;
+
+   struct pipe_transfer *transfer_uv;
+   uint8_t *data_uv = state->pctx->texture_map(state->pctx,
+                                             image->planes[plane].bo,
+                                             0,
+                                             PIPE_MAP_READ,
+                                             &box,
+                                             &transfer_uv);
+   
+   for (int r = 0; r < box.height; r++) {
+      for (int c = 0; c < box.width; c++) {
+         yuv->yuv[1][r * box.width + c] = data_uv[r * transfer_uv->stride + c * 2];
+         yuv->yuv[2][r * box.width + c] = data_uv[r * transfer_uv->stride + c * 2 + 1];
+      }
+   }
+
+   state->pctx->texture_unmap(state->pctx, transfer_uv);
+   
+   transfers[1] = transfers[2] = NULL;
+}
+
+static void
+unmap_image(struct rendering_state *state, struct pipe_transfer *transfers[3])
+{
+   for (int p = 0; p < 3; ++p)
+   {
+      if (transfers[p])
+         state->pctx->texture_unmap(state->pctx, transfers[p]);
+   }
+}
+
+static void
 handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
    struct vk_cmd_encode_video_khr *encode_video = &cmd->u.encode_video_khr;
@@ -4716,108 +4827,18 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    struct lvp_video_session* video_session = state->video_encode.active_video_session;
    //printf("Encode VideoSession: %p\n", video_session);
 
-   const struct lvp_image_view *src_image_view = lvp_image_view_from_handle(encode_video->encode_info->srcPictureResource.imageViewBinding);
-   const struct lvp_image *src_image = src_image_view->image;
+   H264E_io_yuv_t src_yuv;
+   struct pipe_transfer *src_transfers[3];
 
-   struct pipe_box src_box_y;
-   struct pipe_transfer *src_t_y, *src_t_u = NULL, *src_t_v = NULL;
-   uint8_t plane;
-   enum pipe_format src_format;
-   H264E_io_yuv_t yuv;
-
-   plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_0_BIT);
-   src_format = src_image->planes[plane].bo->format;
-   assert(src_format == PIPE_FORMAT_R8_UNORM);
-
-   src_box_y.x = encode_video->encode_info->srcPictureResource.codedOffset.x;
-   src_box_y.y = encode_video->encode_info->srcPictureResource.codedOffset.y;
-   src_box_y.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
-   src_box_y.width = encode_video->encode_info->srcPictureResource.codedExtent.width;
-   src_box_y.height = encode_video->encode_info->srcPictureResource.codedExtent.height;
-   src_box_y.depth = 1;
-   
-   yuv.yuv[0] = state->pctx->texture_map(state->pctx,
-                                          src_image->planes[plane].bo,
-                                          0,
-                                          PIPE_MAP_READ,
-                                          &src_box_y,
-                                          &src_t_y);
-   yuv.stride[0] = src_t_y->stride;
-
-   struct pipe_box src_box_uv;
-   src_box_uv.x = encode_video->encode_info->srcPictureResource.codedOffset.x / 2;
-   src_box_uv.y = encode_video->encode_info->srcPictureResource.codedOffset.y / 2;
-   src_box_uv.z = encode_video->encode_info->srcPictureResource.baseArrayLayer;
-   src_box_uv.width = encode_video->encode_info->srcPictureResource.codedExtent.width / 2;
-   src_box_uv.height = encode_video->encode_info->srcPictureResource.codedExtent.height / 2;
-   src_box_uv.depth = 1;
-
-   if (src_image->plane_count == 2)
-   {
-      assert(src_image->vk.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM);
-      assert(video_session->split_buffers);
-      struct pipe_transfer *src_t_uv;
-      uint8_t *src_data_uv;
-      size_t size;
-
-      plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_1_BIT);
-      src_format = src_image->planes[plane].bo->format;
-      assert(src_format == PIPE_FORMAT_R8G8_UNORM);
-
-      // TODO: support 3 plane image format for skipping the UV split
-      size = src_box_uv.width * src_box_uv.height;
-      yuv.yuv[1] = video_session->split_buffers;
-      yuv.stride[1] = src_box_uv.width;
-      yuv.yuv[2] = video_session->split_buffers + size;
-      yuv.stride[2] = src_box_uv.width;
-
-      src_data_uv = state->pctx->texture_map(state->pctx,
-                                             src_image->planes[plane].bo,
-                                             0,
-                                             PIPE_MAP_READ,
-                                             &src_box_uv,
-                                             &src_t_uv);
-   
-      for (int r = 0; r < src_box_uv.height; r++) {
-         for (int c = 0; c < src_box_uv.width; c++) {
-            yuv.yuv[1][r * src_box_uv.width + c] = src_data_uv[r * src_t_uv->stride + c * 2];
-            yuv.yuv[2][r * src_box_uv.width + c] = src_data_uv[r * src_t_uv->stride + c * 2 + 1];
-         }
-      }
-
-      state->pctx->texture_unmap(state->pctx, src_t_uv);
-   }
+   if (video_session->split_buffers)
+      convert_image_to_ioyuv(state, &encode_video->encode_info->srcPictureResource, &src_yuv, src_transfers);
    else
-   {
-      assert(src_image->plane_count == 3);
-      assert(src_image->vk.format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM);
-      assert(!video_session->split_buffers);
+      map_image_to_ioyuv(state, &encode_video->encode_info->srcPictureResource, PIPE_MAP_READ, &src_yuv, src_transfers);
 
-      plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_1_BIT);
-      src_format = src_image->planes[plane].bo->format;
-      assert(src_format == PIPE_FORMAT_R8_UNORM);
-
-      yuv.yuv[1] = state->pctx->texture_map(state->pctx,
-                                             src_image->planes[plane].bo,
-                                             0,
-                                             PIPE_MAP_READ,
-                                             &src_box_uv,
-                                             &src_t_u);
-      yuv.stride[1] = src_t_u->stride;
-
-      plane = lvp_image_aspects_to_plane(src_image, VK_IMAGE_ASPECT_PLANE_2_BIT);
-      src_format = src_image->planes[plane].bo->format;
-      assert(src_format == PIPE_FORMAT_R8_UNORM);
-
-      yuv.yuv[2] = state->pctx->texture_map(state->pctx,
-                                             src_image->planes[plane].bo,
-                                             0,
-                                             PIPE_MAP_READ,
-                                             &src_box_uv,
-                                             &src_t_v);
-      yuv.stride[2] = src_t_v->stride;
-   }
-
+   H264E_io_yuv_t dec_yuv;
+   struct pipe_transfer *dec_transfers[3];
+   map_image_to_ioyuv(state, encode_video->encode_info->pSetupReferenceSlot->pPictureResource, PIPE_MAP_WRITE, &dec_yuv, dec_transfers);
+   
    struct VkVideoEncodeH264PictureInfoKHR *pic_info = vk_find_struct(encode_video->encode_info, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
 
    H264E_run_param_t run_param;
@@ -4844,32 +4865,40 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    int sizeof_coded_data = 0;
    int error;
 
-   error = H264E_encode(video_session->enc, video_session->scratch, &run_param, &yuv, &coded_data, &sizeof_coded_data);
+   error = H264E_encode(video_session->enc, video_session->scratch, &run_param, &src_yuv, &coded_data, &sizeof_coded_data);
    if (error)
    {
       printf("H264E_encode error = %d\n", error);
    }
+   VkQueryResultStatusKHR status = error == H264E_STATUS_SUCCESS ? VK_QUERY_RESULT_STATUS_COMPLETE_KHR : VK_QUERY_RESULT_STATUS_ERROR_KHR;
 
-   state->pctx->texture_unmap(state->pctx, src_t_y);
-   if (src_t_u)
-      state->pctx->texture_unmap(state->pctx, src_t_u);
-   if (src_t_v)
-      state->pctx->texture_unmap(state->pctx, src_t_v);
+   unmap_image(state, dec_transfers);
+   unmap_image(state, src_transfers);
 
-   uint32_t *dst;
-   struct pipe_transfer *dst_t;
-   struct pipe_box dst_box;
+   if (status == VK_QUERY_RESULT_STATUS_COMPLETE_KHR)
+   {
+      if (sizeof_coded_data > encode_video->encode_info->dstBufferRange)
+         status = VK_QUERY_RESULT_STATUS_INSUFFICIENT_BITSTREAM_BUFFER_RANGE_KHR;
+      else
+      {
+         uint32_t *dst;
+         struct pipe_transfer *dst_t;
+         struct pipe_box dst_box;
 
-   // TODO: handle encode_video->encode_info->dstBufferRange
-   u_box_1d(encode_video->encode_info->dstBufferOffset, sizeof_coded_data, &dst_box);
-   dst = state->pctx->buffer_map(state->pctx,
-                                   dst_buffer->bo,
-                                   0,
-                                   PIPE_MAP_WRITE,
-                                   &dst_box,
-                                   &dst_t);
-   memcpy(dst, coded_data, sizeof_coded_data);
-   state->pctx->buffer_unmap(state->pctx, dst_t);
+         u_box_1d(encode_video->encode_info->dstBufferOffset, sizeof_coded_data, &dst_box);
+         dst = state->pctx->buffer_map(state->pctx,
+                                         dst_buffer->bo,
+                                         0,
+                                         PIPE_MAP_WRITE,
+                                         &dst_box,
+                                         &dst_t);
+         memcpy(dst, coded_data, sizeof_coded_data);
+         state->pctx->buffer_unmap(state->pctx, dst_t);
+      }
+   }
+   
+   if (status != VK_QUERY_RESULT_STATUS_COMPLETE_KHR)
+      sizeof_coded_data = 0;
 
    /* update query value */
    struct lvp_query_pool *query = state->video_encode.active_query;
@@ -4882,7 +4911,7 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
          *data++ = sizeof_coded_data;
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR)
          *data++ = 0;
-      *data = error == H264E_STATUS_SUCCESS ? VK_QUERY_RESULT_STATUS_COMPLETE_KHR : VK_QUERY_RESULT_STATUS_ERROR_KHR;
+      *data = status;
    }
 }
 
