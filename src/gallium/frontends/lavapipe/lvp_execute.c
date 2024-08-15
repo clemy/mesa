@@ -4705,19 +4705,26 @@ handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_sta
 }
 
 static void
-map_image_to_ioyuv(struct rendering_state *state, const VkVideoPictureResourceInfoKHR *pic, enum pipe_map_flags map_flags, H264E_io_yuv_t *yuv, struct pipe_transfer *transfers[3])
+map_image_to_ioyuv(struct rendering_state *state, const VkVideoPictureResourceInfoKHR *pic, enum pipe_map_flags map_flags, int border_extend, H264E_io_yuv_t *yuv, struct pipe_transfer *transfers[3])
 {
    const struct lvp_image_view *image_view = lvp_image_view_from_handle(pic->imageViewBinding);
    const struct lvp_image *image = image_view->image;
    assert(image->plane_count == 3);
    assert(image->vk.format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM);
 
+   int plane_border_extend = border_extend;
+   uint32_t width = pic->codedExtent.width;
+   uint32_t height = pic->codedExtent.height;
+   if (plane_border_extend) {
+      width = align(width, plane_border_extend);
+      height = align(height, plane_border_extend);
+   }
    struct pipe_box box;
    box.x = pic->codedOffset.x;
    box.y = pic->codedOffset.y;
    box.z = image_view->vk.base_array_layer + pic->baseArrayLayer;
-   box.width = pic->codedExtent.width;
-   box.height = pic->codedExtent.height;
+   box.width = width + 2 * plane_border_extend;
+   box.height = height + 2 * plane_border_extend;
    box.depth = 1;
    
    const VkImageAspectFlagBits planes[] = {
@@ -4734,12 +4741,14 @@ map_image_to_ioyuv(struct rendering_state *state, const VkVideoPictureResourceIn
                                              map_flags,
                                              &box,
                                              &transfers[p]);
+      yuv->yuv[p] += plane_border_extend * transfers[p]->stride + plane_border_extend;
       yuv->stride[p] = transfers[p]->stride;
 
+      plane_border_extend = border_extend / 2;
       box.x = pic->codedOffset.x / 2;
       box.y = pic->codedOffset.y / 2;
-      box.width = pic->codedExtent.width / 2;
-      box.height = pic->codedExtent.height / 2;
+      box.width = width / 2 + 2 * plane_border_extend;
+      box.height = height / 2 + 2 * plane_border_extend;
    }
 }
 
@@ -4833,12 +4842,21 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    if (video_session->split_buffers)
       convert_image_to_ioyuv(state, &encode_video->encode_info->srcPictureResource, &src_yuv, src_transfers);
    else
-      map_image_to_ioyuv(state, &encode_video->encode_info->srcPictureResource, PIPE_MAP_READ, &src_yuv, src_transfers);
+      map_image_to_ioyuv(state, &encode_video->encode_info->srcPictureResource, PIPE_MAP_READ, 0, &src_yuv, src_transfers);
 
    H264E_io_yuv_t dec_yuv;
    struct pipe_transfer *dec_transfers[3];
-   map_image_to_ioyuv(state, encode_video->encode_info->pSetupReferenceSlot->pPictureResource, PIPE_MAP_WRITE, &dec_yuv, dec_transfers);
-   
+   map_image_to_ioyuv(state, encode_video->encode_info->pSetupReferenceSlot->pPictureResource, PIPE_MAP_WRITE, H264E_BORDER_PADDING, &dec_yuv, dec_transfers);
+
+   H264E_io_yuv_t *ref_yuv_ptr = NULL;
+   H264E_io_yuv_t ref_yuv;
+   struct pipe_transfer *ref_transfers[3] = {NULL, NULL, NULL};
+   if (encode_video->encode_info->referenceSlotCount >= 1)
+   {
+      map_image_to_ioyuv(state, encode_video->encode_info->pReferenceSlots[0].pPictureResource, PIPE_MAP_READ, H264E_BORDER_PADDING, &ref_yuv, ref_transfers);
+      ref_yuv_ptr = &ref_yuv;
+   }
+
    struct VkVideoEncodeH264PictureInfoKHR *pic_info = vk_find_struct(encode_video->encode_info, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
 
    H264E_run_param_t run_param;
@@ -4865,13 +4883,14 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
    int sizeof_coded_data = 0;
    int error;
 
-   error = H264E_encode(video_session->enc, video_session->scratch, &run_param, &src_yuv, &coded_data, &sizeof_coded_data);
+   error = H264E_encode(video_session->enc, video_session->scratch, &run_param, &src_yuv, ref_yuv_ptr, &dec_yuv, &coded_data, &sizeof_coded_data);
    if (error)
    {
       printf("H264E_encode error = %d\n", error);
    }
    VkQueryResultStatusKHR status = error == H264E_STATUS_SUCCESS ? VK_QUERY_RESULT_STATUS_COMPLETE_KHR : VK_QUERY_RESULT_STATUS_ERROR_KHR;
 
+   unmap_image(state, ref_transfers);
    unmap_image(state, dec_transfers);
    unmap_image(state, src_transfers);
 

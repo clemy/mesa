@@ -1715,21 +1715,21 @@ static void h264e_copy_16x16(pix_t* d, int d_stride, const pix_t* s, int s_strid
 #endif /* H264E_ENABLE_PLAIN_C */
 
 #if H264E_ENABLE_PLAIN_C || (H264E_ENABLE_NEON && !defined(MINIH264_ASM))
-static void h264e_copy_borders(unsigned char *pic, int w, int h, int guard)
+static void h264e_copy_borders(unsigned char *pic, int w, int h, int stride, int guard)
 {
     int r, rowbytes = w + 2*guard;
     unsigned char *d = pic - guard;
-    for (r = 0; r < h; r++, d += rowbytes)
+    for (r = 0; r < h; r++, d += stride)
     {
         memset(d, d[guard], guard);
         memset(d + rowbytes - guard, d[rowbytes - guard - 1], guard);
     }
-    d = pic - guard - guard*rowbytes;
+    d = pic - guard - guard*stride;
     for (r = 0; r < guard; r++)
     {
         memcpy(d, pic - guard, rowbytes);
-        memcpy(d + (guard + h)*rowbytes, pic - guard + (h - 1)*rowbytes, rowbytes);
-        d += rowbytes;
+        memcpy(d + (guard + h)*stride, pic - guard + (h - 1)*stride, rowbytes);
+        d += stride;
     }
 }
 #endif /* H264E_ENABLE_PLAIN_C || (H264E_ENABLE_NEON && !defined(MINIH264_ASM)) */
@@ -2729,16 +2729,14 @@ static void pix_copy_cropped_mb(pix_t* d, int d_stride, const pix_t* s, int s_st
 }
 
 /**
-*   Copy reconstructed frame to reference buffer, with borders extension
+*   Extend decoded picture with borders
 */
-static void pix_copy_recon_pic_to_ref(h264e_enc_t *enc)
+static void dec_add_border(h264e_enc_t *enc)
 {
     int c, h = enc->frame.h, w = enc->frame.w, guard = 16;
     for (c = 0; c < 3; c++)
     {
-       SWAP(pix_t*, enc->ref.yuv[c], enc->dec.yuv[c]);
-
-       h264e_copy_borders(enc->ref.yuv[c], w, h, guard);
+       h264e_copy_borders(enc->dec.yuv[c], w, h, enc->dec.stride[c], guard);
        if (!c) guard >>= 1, w >>= 1, h >>= 1;
     }
 }
@@ -4764,23 +4762,6 @@ static void encode_slice(h264e_enc_t* enc, int frame_type, int pps_id)
 }
 
 /**
-*   Setup H264E_io_yuv_t structures
-*/
-static pix_t* io_yuv_set_pointers(pix_t* base, H264E_io_yuv_t* frm, int w, int h)
-{
-    int s = w + (16 + 16);    // guards
-    int i, guard = 16;
-    for (i = 0; i < 3; i++)
-    {
-        frm->stride[i] = s;
-        frm->yuv[i] = base + (s + 1) * guard;
-        base += s * (h + 2 * guard);
-        if (!i) guard >>= 1, s >>= 1, h >>= 1;
-    }
-    return base;
-}
-
-/**
 *   Verify encoder creation parameters. Return error code, or 0 if prameters
 */
 static int enc_check_create_params(const H264E_create_param_t* par)
@@ -4921,10 +4902,6 @@ static int rc_frame_start(h264e_enc_t* enc)
 static int enc_alloc(h264e_enc_t* enc, const H264E_create_param_t* par, unsigned char* p)
 {
     unsigned char* p0 = p;
-    int nmbx = (par->width + 15) >> 4;
-    int nmby = (par->height + 15) >> 4;
-    int nref_frames = 1 + 0 + 1;
-    ALLOC(enc->ref.yuv[0], ((nmbx + 2) * (nmby + 2) * 384) * nref_frames);
     return (int)((p - p0) + 15) & ~15u;
 }
 
@@ -4999,9 +4976,6 @@ static int H264E_init_one(h264e_enc_t* enc, const H264E_create_param_t* opt)
 
     enc_alloc(enc, opt, (void*)(enc + 1));
 
-    base = io_yuv_set_pointers(enc->ref.yuv[0], &enc->ref, enc->frame.nmbx * 16, enc->frame.nmby * 16);
-    base = io_yuv_set_pointers(base, &enc->dec, enc->frame.nmbx * 16, enc->frame.nmby * 16);
-
     return H264E_STATUS_SUCCESS;
 }
 
@@ -5034,7 +5008,7 @@ static int H264E_encode_one(H264E_persist_t* enc, const H264E_run_param_t* opt, 
 
     //rc_frame_end(enc, long_term_idx_use == -1, enc->mb.skip_run == enc->frame.nmb, is_refers_to_long_term);
 
-    pix_copy_recon_pic_to_ref(enc);
+    dec_add_border(enc);
 
     ++enc->frame.num;
 
@@ -5071,13 +5045,28 @@ static int check_parameters_align(const H264E_create_param_t* opt, const H264E_i
 *   See header file for details.
 */
 int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run_param_t* opt,
-    H264E_io_yuv_t* in, unsigned char** coded_data, int* sizeof_coded_data)
+    H264E_io_yuv_t* in, H264E_io_yuv_t* ref, H264E_io_yuv_t* dec, unsigned char** coded_data, int* sizeof_coded_data)
 {
     int i;
     int frame_type = opt->frame_type;
     int error;
 
     error = check_parameters_align(&enc->param, in);
+    if (error)
+    {
+        return error;
+    }
+    if (!ref) {
+       if (frame_type == H264E_FRAME_TYPE_P)
+           return H264E_STATUS_BAD_ARGUMENT;
+    } else {
+       error = check_parameters_align(&enc->param, ref);
+       if (error)
+       {
+           return error;
+       }
+    }
+    error = check_parameters_align(&enc->param, dec);
     if (error)
     {
         return error;
@@ -5126,6 +5115,12 @@ int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run
 
         //encode_sps(enc, 66, sps_id);
         //encode_pps(enc, sps_id, pps_id);
+    }
+
+    enc->dec = *dec;
+    if (ref)
+    {
+        enc->ref = *ref;
     }
 
     H264E_encode_one(enc, opt, frame_type, pps_id);
