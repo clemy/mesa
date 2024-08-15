@@ -30,6 +30,11 @@
 #define H264E_SPEED_FASTEST         10      // Minimum tools enabled
 
 /**
+*   Border padding size
+*/
+#define H264E_BORDER_PADDING        16
+
+/**
 *   Creations parameters
 */
 typedef struct H264E_create_param_tag
@@ -79,4 +84,4 @@ typedef struct H264E_scratch_tag H264E_scratch_t;
 int H264E_sizeof(const H264E_create_param_t* par, int* sizeof_persist, int* sizeof_scratch);
 int H264E_init(H264E_persist_t* enc, const H264E_create_param_t* opt);
 int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run_param_t* opt,
-    H264E_io_yuv_t* in, unsigned char** coded_data, int* sizeof_coded_data);
+    H264E_io_yuv_t* in, H264E_io_yuv_t* ref, H264E_io_yuv_t* dec, unsigned char** coded_data, int* sizeof_coded_data);

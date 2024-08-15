@@ -100,7 +100,7 @@ lvp_image_create(VkDevice _device,
       vk_find_struct_const(pCreateInfo->pNext, VIDEO_PROFILE_LIST_INFO_KHR);
       for (unsigned p = 0; video_profile_list && p < video_profile_list->profileCount; p++) {
          if (video_profile_list->pProfiles[p].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR)
-            video_dpb_border = 16; // one macroblock around whole image for border of motion detection
+            video_dpb_border = H264E_BORDER_PADDING; // one macroblock around whole image for border of motion detection
       }
    }
    for (unsigned p = 0; p < image->plane_count; p++) {
@@ -160,8 +160,8 @@ lvp_image_create(VkDevice _device,
       if (pCreateInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
          template.flags |= PIPE_RESOURCE_FLAG_SPARSE;
 
-      template.width0 = (pCreateInfo->extent.width + 2 * video_dpb_border) / width_scale;
-      template.height0 = (pCreateInfo->extent.height + 2 * video_dpb_border) / height_scale;
+      template.width0 = (video_dpb_border ? (align(pCreateInfo->extent.width, video_dpb_border) + 2 * video_dpb_border) : pCreateInfo->extent.width) / width_scale;
+      template.height0 = (video_dpb_border ? (align(pCreateInfo->extent.height, video_dpb_border) + 2 * video_dpb_border) : pCreateInfo->extent.height) / height_scale;
       template.depth0 = pCreateInfo->extent.depth;
       template.array_size = pCreateInfo->arrayLayers;
       template.last_level = pCreateInfo->mipLevels - 1;
