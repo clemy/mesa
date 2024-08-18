@@ -23,7 +23,7 @@ class Extension:
 
     def from_xml(ext_elem):
         name = ext_elem.attrib['name']
-        number = int(ext_elem.attrib['number'])
+        number = int(ext_elem.attrib.get('number', -1))
         supported = get_api_list(ext_elem.attrib['supported'])
         if name == 'VK_ANDROID_native_buffer':
             assert not supported
@@ -38,11 +38,16 @@ class Extension:
                 # Skip alias SPEC_VERSIONs
                 if 'value' in enum_elem.attrib:
                     assert version is None
-                    version = int(enum_elem.attrib['value'])
+                    try:
+                        version = int(enum_elem.attrib['value'])
+                    except ValueError:
+                        version = -1
 
-        assert version is not None
+        # assert version is not None
+        if (version is None):
+            version = -1
         ext = Extension(name, number, version)
-        ext.type = ext_elem.attrib['type']
+        ext.type = ext_elem.attrib.get('type', None)
         ext.platform = ext_elem.attrib.get('platform', None)
         ext.provisional = ext_elem.attrib.get('provisional', False)
         ext.supported = supported
