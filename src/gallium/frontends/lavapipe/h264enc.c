@@ -4956,7 +4956,6 @@ int H264E_sizeof(const H264E_create_param_t* par, int* sizeof_persist, int* size
 
 static int H264E_init_one(h264e_enc_t* enc, const H264E_create_param_t* opt)
 {
-    pix_t* base;
 #if H264E_CONFIGS_COUNT > 1
     init_vft(opt->enableNEON);
 #endif
@@ -5104,8 +5103,8 @@ int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run
 
     enc->speed.disable_deblock = (opt->encode_speed == 8 || opt->encode_speed == 10);
 
-    const sps_id = 0;
-    const pps_id = sps_id * 4 + 0;
+    const int sps_id = 0;
+    const int pps_id = sps_id * 4 + 0;
 
     if (frame_type == H264E_FRAME_TYPE_KEY)
     {

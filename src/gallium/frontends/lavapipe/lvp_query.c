@@ -36,7 +36,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_CreateQueryPool(
 
    uint32_t query_size = sizeof(struct pipe_query *);
    enum pipe_query_type pipeq;
-   VkVideoEncodeFeedbackFlagsKHR video_encode_feedback;
+   VkVideoEncodeFeedbackFlagsKHR video_encode_feedback = 0;
    switch (pCreateInfo->queryType) {
    case VK_QUERY_TYPE_OCCLUSION:
       pipeq = PIPE_QUERY_OCCLUSION_COUNTER;
@@ -152,7 +152,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lvp_GetQueryPoolResults(
       /* TODO: handle wait bit and partial queries for video */
       if (pool->base_type == LVP_QUERY_VIDEO_ENCODE_FEEDBACK) {
          int length = util_bitcount(pool->video_encode_feedback);
-         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | flags & VK_QUERY_RESULT_WITH_STATUS_BIT_KHR)
+         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT || flags & VK_QUERY_RESULT_WITH_STATUS_BIT_KHR)
             ++length;
          if (flags & VK_QUERY_RESULT_64_BIT) {
             uint64_t *dst = (uint64_t *)dest;

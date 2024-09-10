@@ -332,9 +332,9 @@ lvp_CreateVideoSessionParametersKHR(VkDevice _device,
    }
 
    for (uint32_t i = 0; i < params->vk.h264_enc.h264_pps_count; ++i) {
-      StdVideoH264PictureParameterSet *pps = &params->vk.h264_enc.h264_pps[i].base;
+      //StdVideoH264PictureParameterSet *pps = &params->vk.h264_enc.h264_pps[i].base;
       // TODO: replace example override with correct PPS overrides
-      pps;
+      //pps;
       //params->has_pps_overides = true;
    }
 
