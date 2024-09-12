@@ -1501,6 +1501,15 @@ VKAPI_ATTR void VKAPI_CALL lvp_GetPhysicalDeviceQueueFamilyProperties2(
             }
             break;
          }
+         case VK_STRUCTURE_TYPE_QUEUE_FAMILY_QUERY_RESULT_STATUS_PROPERTIES_KHR: {
+            VkQueueFamilyQueryResultStatusPropertiesKHR *prop = (VkQueueFamilyQueryResultStatusPropertiesKHR *)ext;
+            // TODO: if we report this with true, we also must support VK_QUERY_TYPE_RESULT_STATUS_ONLY_KHR, which we do not do yet
+            if (pQueueFamilyProperties[i].queueFamilyProperties.queueFlags & VK_QUEUE_VIDEO_ENCODE_BIT_KHR)
+               prop->queryResultStatusSupport = VK_TRUE;
+            else
+               prop->queryResultStatusSupport = VK_FALSE;
+            break;
+         }
          default:
             break;
          }
