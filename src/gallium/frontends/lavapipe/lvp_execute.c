@@ -208,6 +208,7 @@ struct rendering_state {
    struct {
       struct lvp_query_pool *active_query;
       struct lvp_video_session *active_video_session;
+      uint32_t active_query_num;
    } video_encode;
 };
 
@@ -2885,6 +2886,7 @@ static void handle_begin_query(struct vk_cmd_queue_entry *cmd,
 
    if (pool->type == VK_QUERY_TYPE_VIDEO_ENCODE_FEEDBACK_KHR) {
       state->video_encode.active_query = pool;
+      state->video_encode.active_query_num = qcmd->query;
       return;
    }
 
@@ -4921,9 +4923,10 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
 
    /* update query value */
    struct lvp_query_pool *query = state->video_encode.active_query;
+   uint32_t query_size = util_bitcount(query->video_encode_feedback) + 1;
    if (query) {
       /* TODO: add an index to the last active query and increase it */
-      uint64_t *data = (uint64_t *)query->data;
+      uint64_t *data = (uint64_t *)query->data + state->video_encode.active_query_num * query_size;
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BUFFER_OFFSET_BIT_KHR)
          *data++ = 0;
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_BYTES_WRITTEN_BIT_KHR)
@@ -4931,6 +4934,7 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
       if (query->video_encode_feedback & VK_VIDEO_ENCODE_FEEDBACK_BITSTREAM_HAS_OVERRIDES_BIT_KHR)
          *data++ = 0;
       *data = status;
+      ++state->video_encode.active_query_num;
    }
 }
 
