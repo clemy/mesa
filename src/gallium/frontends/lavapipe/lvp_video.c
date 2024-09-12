@@ -25,7 +25,8 @@ lvp_GetPhysicalDeviceVideoCapabilitiesKHR(VkPhysicalDevice physicalDevice, const
    const struct VkVideoEncodeH264ProfileInfoKHR *h264_profile =
       vk_find_struct_const(pVideoProfile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
 
-   if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
+   if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE &&
+       h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_MAIN)
       return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
 
    pCapabilities->flags = VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR;
@@ -106,7 +107,8 @@ lvp_GetPhysicalDeviceVideoFormatPropertiesKHR(VkPhysicalDevice physicalDevice,
 
       const VkVideoEncodeH264ProfileInfoKHR *h264_profile =
          vk_find_struct_const(video_profile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
-      if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
+      if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE &&
+          h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_MAIN)
          return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
    }
 
@@ -156,7 +158,8 @@ lvp_GetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR(VkPhysicalDevice physi
 
    const VkVideoEncodeH264ProfileInfoKHR *h264_profile =
       vk_find_struct_const(pQualityLevelInfo->pVideoProfile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
-   if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE)
+   if (h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE &&
+       h264_profile->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_MAIN)
       return VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
 
    pQualityLevelProperties->preferredRateControlLayerCount = 0;

@@ -376,7 +376,8 @@ static VkResult lvp_get_image_format_properties(struct lvp_physical_device *phys
          }
          const VkVideoEncodeH264ProfileInfoKHR *video_profile_list =
             vk_find_struct_const(video_profile->pNext, VIDEO_ENCODE_H264_PROFILE_INFO_KHR);
-         if (video_profile_list->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE) {
+         if (video_profile_list->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_BASELINE &&
+             video_profile_list->stdProfileIdc != STD_VIDEO_H264_PROFILE_IDC_MAIN) {
             result = VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR;
             goto unsupported;
          }
