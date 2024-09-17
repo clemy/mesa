@@ -4992,7 +4992,7 @@ int H264E_init(H264E_persist_t* enc, const H264E_create_param_t* opt)
     return ret;
 }
 
-static int H264E_encode_one(H264E_persist_t* enc, const H264E_run_param_t* opt, int frame_type, int pps_id)
+static int H264E_encode_one(H264E_persist_t* enc, const H264E_run_param_t* opt, int frame_type)
 {
     // slice reset
     // TODO: slice type should be coming from std slice header structure
@@ -5003,7 +5003,7 @@ static int H264E_encode_one(H264E_persist_t* enc, const H264E_run_param_t* opt, 
 
     enc->mb.x = enc->mb.y = enc->mb.num = 0;
 
-    encode_slice(enc, frame_type, pps_id);
+    encode_slice(enc, frame_type, opt->pps_id);
 
     //rc_frame_end(enc, long_term_idx_use == -1, enc->mb.skip_run == enc->frame.nmb, is_refers_to_long_term);
 
@@ -5103,17 +5103,12 @@ int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run
 
     enc->speed.disable_deblock = (opt->encode_speed == 8 || opt->encode_speed == 10);
 
-    const int sps_id = 0;
-    const int pps_id = sps_id * 4 + 0;
+    enc->sps.pic_init_qp = enc->run_param.pps_qp;
 
     if (frame_type == H264E_FRAME_TYPE_KEY)
     {
-        enc->sps.pic_init_qp = enc->run_param.qp;
         enc->next_idr_pic_id ^= 1;
         enc->frame.num = 0;
-
-        //encode_sps(enc, 66, sps_id);
-        //encode_pps(enc, sps_id, pps_id);
     }
 
     enc->dec = *dec;
@@ -5122,7 +5117,7 @@ int H264E_encode(H264E_persist_t* enc, H264E_scratch_t* scratch, const H264E_run
         enc->ref = *ref;
     }
 
-    H264E_encode_one(enc, opt, frame_type, pps_id);
+    H264E_encode_one(enc, opt, frame_type);
 
     *sizeof_coded_data = enc->out_pos;
     *coded_data = enc->out;

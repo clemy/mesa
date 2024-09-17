@@ -64,6 +64,12 @@ typedef struct H264E_run_param_tag
     // range: [10; 51]
     int qp;
 
+    // PPS quantizer value (as specified in active PPS)
+    int pps_qp;
+
+    // PPS ID for the next slice
+    int pps_id;
+
 } H264E_run_param_t;
 
 /**

@@ -636,6 +636,7 @@ struct lvp_video_session {
    H264E_persist_t* enc;
    H264E_scratch_t* scratch;
    uint8_t* split_buffers;
+   VkVideoEncodeRateControlModeFlagBitsKHR rate_control_mode;
 };
 
 struct lvp_video_session_params {

@@ -208,6 +208,7 @@ struct rendering_state {
    struct {
       struct lvp_query_pool *active_query;
       struct lvp_video_session *active_video_session;
+      struct lvp_video_session_params *active_video_session_params;      
       uint32_t active_query_num;
    } video_encode;
 };
@@ -4692,18 +4693,27 @@ handle_begin_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state
    VK_FROM_HANDLE(lvp_video_session, vid_session, begin_video_coding->begin_info->videoSession);
    state->video_encode.active_video_session = vid_session;
 
-   /* TODO: Store session parameters */
+   VK_FROM_HANDLE(lvp_video_session_params, vid_session_params, begin_video_coding->begin_info->videoSessionParameters);
+   state->video_encode.active_video_session_params = vid_session_params;
 }
 
 static void
 handle_control_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *state)
 {
-   //struct vk_cmd_control_video_coding_khr *control_video_coding = &cmd->u.control_video_coding_khr;
+   struct vk_cmd_control_video_coding_khr *control_video_coding = &cmd->u.control_video_coding_khr;
 
    //printf("Control: %u\n", control_video_coding->coding_control_info->flags);
 
-   /* TODO: Update video session parameters */
-   /* TODO: Handle reset */
+   if (control_video_coding->coding_control_info->flags & VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR) {
+      state->video_encode.active_video_session->rate_control_mode = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR;
+   }
+
+   if (control_video_coding->coding_control_info->flags & VK_VIDEO_CODING_CONTROL_ENCODE_RATE_CONTROL_BIT_KHR) {
+      const struct VkVideoEncodeRateControlInfoKHR *rate_control_info = vk_find_struct_const(control_video_coding->coding_control_info->pNext, VIDEO_ENCODE_RATE_CONTROL_INFO_KHR);
+      assert(rate_control_info);
+      assert(rate_control_info->rateControlMode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR || rate_control_info->rateControlMode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR);
+      state->video_encode.active_video_session->rate_control_mode = rate_control_info->rateControlMode;
+   }
 }
 
 static void
@@ -4837,6 +4847,8 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
 
    struct lvp_video_session* video_session = state->video_encode.active_video_session;
    //printf("Encode VideoSession: %p\n", video_session);
+   struct lvp_video_session_params* video_session_params = state->video_encode.active_video_session_params;
+
 
    H264E_io_yuv_t src_yuv;
    struct pipe_transfer *src_transfers[3];
@@ -4879,7 +4891,21 @@ handle_encode_video(struct vk_cmd_queue_entry *cmd, struct rendering_state *stat
          assert(0);
          break;
    }
-   run_param.qp = 26; // TODO: get initial QP from SPS and set to enc->sps.pic_init_qp
+
+   //const uint8_t sps_id = pic_info->pStdPictureInfo->seq_parameter_set_id;
+   //const StdVideoH264SequenceParameterSet *sps = vk_video_find_h264_enc_std_sps(&video_session_params->vk, sps_id);
+   const uint8_t pps_id = pic_info->pStdPictureInfo->pic_parameter_set_id;
+   const StdVideoH264PictureParameterSet *pps = vk_video_find_h264_enc_std_pps(&video_session_params->vk, pps_id);
+
+   assert(pic_info->naluSliceEntryCount == 1);
+   run_param.pps_id = pps_id;
+   run_param.pps_qp = pps->pic_init_qp_minus26 + 26;
+   if (state->video_encode.active_video_session->rate_control_mode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DEFAULT_KHR) {
+      run_param.qp = run_param.pps_qp;
+   }
+   else {
+      run_param.qp = pic_info->pNaluSliceEntries[0].constantQp;
+   }
 
    uint8_t* coded_data;
    int sizeof_coded_data = 0;
@@ -4946,8 +4972,7 @@ handle_end_video_coding(struct vk_cmd_queue_entry *cmd, struct rendering_state *
    //printf("End: %u\n", end_video_coding->end_coding_info->flags);
 
    state->video_encode.active_video_session = NULL;
-
-   /* TODO: Unset video session parameters */
+   state->video_encode.active_video_session_params = NULL;
 }
 
 void lvp_add_enqueue_cmd_entrypoints(struct vk_device_dispatch_table *disp)
