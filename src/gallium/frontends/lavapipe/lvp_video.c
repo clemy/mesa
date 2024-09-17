@@ -327,18 +327,34 @@ lvp_CreateVideoSessionParametersKHR(VkDevice _device,
    params->has_pps_overides = false;
    for (uint32_t i = 0; i < params->vk.h264_enc.h264_sps_count; ++i) {
       StdVideoH264SequenceParameterSet *sps = &params->vk.h264_enc.h264_sps[i].base;
-      // TODO: replace example override with correct SPS overrides
-      if (!sps->flags.constraint_set1_flag) {
-         sps->flags.constraint_set1_flag = 1u;
+      // TODO: add all necessary overrides according specification and codec
+      //if (!sps->flags.constraint_set1_flag) {
+      //   sps->flags.constraint_set1_flag = 1u;
+      //   params->has_sps_overides = true;
+      //}
+
+      if (sps->log2_max_frame_num_minus4 != 1u) {
+         sps->log2_max_frame_num_minus4 = 1u;
+         params->has_sps_overides = true;
+      }
+
+      if (sps->pic_order_cnt_type != STD_VIDEO_H264_POC_TYPE_2) {
+         sps->pic_order_cnt_type = STD_VIDEO_H264_POC_TYPE_2;
          params->has_sps_overides = true;
       }
    }
 
    for (uint32_t i = 0; i < params->vk.h264_enc.h264_pps_count; ++i) {
-      //StdVideoH264PictureParameterSet *pps = &params->vk.h264_enc.h264_pps[i].base;
-      // TODO: replace example override with correct PPS overrides
-      //pps;
-      //params->has_pps_overides = true;
+      StdVideoH264PictureParameterSet *pps = &params->vk.h264_enc.h264_pps[i].base;
+      // TODO: add all necessary overrides according specification and codec
+      if (!pps->flags.deblocking_filter_control_present_flag) {
+         pps->flags.entropy_coding_mode_flag = 1u;
+         params->has_pps_overides = true;
+      }
+      if (pps->flags.entropy_coding_mode_flag) {
+         pps->flags.entropy_coding_mode_flag = 0u;
+         params->has_pps_overides = true;
+      }
    }
 
    *pVideoSessionParameters = lvp_video_session_params_to_handle(params);
